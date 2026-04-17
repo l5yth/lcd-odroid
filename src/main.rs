@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fs;
 use std::io;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
@@ -21,6 +22,8 @@ use hd44780_driver::{Cursor, CursorBlink, Display, DisplayMode, HD44780, bus::Da
 use linux_embedded_hal::{Delay, I2cdev};
 use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
+
+const CONFIG_PATH: &str = "config.toml";
 
 const HTTP_URL: &str = "http://127.0.0.1:8545";
 const WS_URL: &str = "ws://127.0.0.1:8546";
@@ -34,6 +37,12 @@ const THROTTLE: Duration = Duration::from_secs(1);
 const READ_TIMEOUT: Duration = Duration::from_millis(250);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg: toml::Value = toml::from_str(&fs::read_to_string(CONFIG_PATH)?)?;
+    let layer = cfg
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or("config.toml: missing or non-string 'type' field")?;
+
     let i2c = I2cdev::new("/dev/i2c-0")?;
     let mut delay = Delay;
 
@@ -50,8 +59,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|_| "mode")?;
 
+    match layer {
+        "execution" => run_execution(&mut lcd, &mut delay),
+        other => Err(format!("config.toml: unsupported type {other:?}").into()),
+    }
+}
+
+fn run_execution<B: DataBus>(
+    lcd: &mut HD44780<B>,
+    delay: &mut Delay,
+) -> Result<(), Box<dyn std::error::Error>> {
     let initial = rpc_http("eth_getBlockByNumber", json!(["latest", false]))?;
-    render(&mut lcd, &mut delay, &initial)?;
+    render(lcd, delay, &initial)?;
     let mut last_render = Instant::now();
 
     let (mut ws, _) = tungstenite::connect(WS_URL)?;
@@ -82,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(header) = pending.take() {
             if last_render.elapsed() >= THROTTLE {
-                render(&mut lcd, &mut delay, &header)?;
+                render(lcd, delay, &header)?;
                 last_render = Instant::now();
             } else {
                 pending = Some(header);
