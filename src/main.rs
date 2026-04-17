@@ -23,6 +23,16 @@ use linux_embedded_hal::{Delay, I2cdev};
 use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 
+macro_rules! info {
+    ($($arg:tt)*) => {{
+        eprintln!(
+            "[{}] INFO  {}",
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            format_args!($($arg)*)
+        );
+    }};
+}
+
 const CONFIG_PATH: &str = "config.toml";
 
 const HTTP_URL: &str = "http://127.0.0.1:8545";
@@ -42,6 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get("type")
         .and_then(|v| v.as_str())
         .ok_or("config.toml: missing or non-string 'type' field")?;
+    info!("loaded {} (layer={})", CONFIG_PATH, layer);
 
     let i2c = I2cdev::new("/dev/i2c-0")?;
     let mut delay = Delay;
@@ -58,6 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut delay,
     )
     .map_err(|_| "mode")?;
+    info!("LCD initialized on /dev/i2c-0 @ 0x27");
 
     match layer {
         "execution" => run_execution(&mut lcd, &mut delay),
@@ -70,8 +82,10 @@ fn run_execution<B: DataBus>(
     delay: &mut Delay,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let initial = rpc_http("eth_getBlockByNumber", json!(["latest", false]))?;
+    let initial_n = block_number(&initial);
     render(lcd, delay, &initial)?;
     let mut last_render = Instant::now();
+    info!("initial render: block #{}", group_underscore(initial_n));
 
     let (mut ws, _) = tungstenite::connect(WS_URL)?;
     set_read_timeout(&mut ws, READ_TIMEOUT)?;
@@ -79,6 +93,7 @@ fn run_execution<B: DataBus>(
         json!({"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]})
             .to_string(),
     ))?;
+    info!("subscribed to newHeads at {}", WS_URL);
 
     let mut pending: Option<Value> = None;
     loop {
@@ -87,6 +102,10 @@ fn run_execution<B: DataBus>(
                 let v: Value = serde_json::from_str(&t)?;
                 if v.get("method").and_then(|m| m.as_str()) == Some("eth_subscription") {
                     if let Some(header) = v["params"].get("result") {
+                        info!(
+                            "received new block #{} notification from websocket",
+                            group_underscore(block_number(header))
+                        );
                         pending = Some(header.clone());
                     }
                 }
@@ -103,6 +122,10 @@ fn run_execution<B: DataBus>(
             if last_render.elapsed() >= THROTTLE {
                 render(lcd, delay, &header)?;
                 last_render = Instant::now();
+                info!(
+                    "updated lcd to block #{}",
+                    group_underscore(block_number(&header))
+                );
             } else {
                 pending = Some(header);
             }
@@ -165,6 +188,13 @@ fn set_read_timeout(
         s.set_read_timeout(Some(dur))?;
     }
     Ok(())
+}
+
+fn block_number(header: &Value) -> u64 {
+    header["number"]
+        .as_str()
+        .and_then(|s| parse_hex_u64(s).ok())
+        .unwrap_or(0)
 }
 
 fn parse_hex_u64(s: &str) -> Result<u64, std::num::ParseIntError> {
