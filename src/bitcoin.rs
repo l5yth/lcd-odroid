@@ -26,7 +26,7 @@ use super::group_underscore;
 ///
 /// | Row | Content |
 /// |-----|---------|
-/// | 1   | `"Block   #1_623_137"` – block height right-aligned to 20 chars |
+/// | 1   | `"Block     #1_623_137"` – block height right-aligned to 20 chars |
 /// | 2   | `"0x"` followed by the first 18 characters of the block hash, space-padded |
 /// | 3   | Block timestamp formatted as `YYYY-MM-DD HH:MM:SSZ` (exactly 20 chars) |
 /// | 4   | Fee rate in sat/vByte and peer count, padded to 20 chars |
@@ -53,8 +53,10 @@ pub fn format_lines_bitcoin(
         "{:<20}",
         format!("0x{}", hash.chars().take(18).collect::<String>())
     );
-    // Bitcoin block `time` is a Unix u32 (safely fits in i64; ~year 2106 max).
-    let line3 = DateTime::from_timestamp(timestamp as i64, 0)
+    // Bitcoin block `time` is a Unix u32 (max ~year 2106, always fits in i64),
+    // but use checked conversion for consistency with the consensus module.
+    let ts_i64 = i64::try_from(timestamp).map_err(|_| "timestamp out of i64 range")?;
+    let line3 = DateTime::from_timestamp(ts_i64, 0)
         .ok_or("bad timestamp")?
         .format("%Y-%m-%d %H:%M:%SZ")
         .to_string();
@@ -66,12 +68,18 @@ pub fn format_lines_bitcoin(
 /// Formats the fee-rate / peer-count status line to exactly 20 characters.
 ///
 /// The left column (11 chars) shows the estimated next-block fee rate in sat/vByte:
-/// one decimal place when below 100 sat/vB, no decimal places at or above.
+/// - below 100 sat/vB: one decimal place (`"12.3 sat/vB"` = 11 chars)
+/// - 100–9 999 sat/vB: no decimal places (`"9999 sat/vB"` = 11 chars)
+/// - ≥ 10 000 sat/vB: displayed in ksat/vB (`"10k sat/vB"` = 10 chars); values
+///   above ~999 000 sat/vB (≈10 BTC/vByte) would overflow but are not physically
+///   achievable on mainnet.
+///
 /// The right column (9 chars) shows the connected peer count, right-aligned.
 pub fn format_fee_peers(fee_sat_vb: f64, peers: u64) -> String {
-    // Omit decimals at high values so the column stays within 11 characters.
-    // Max: "99.9 sat/vB" = 11 chars; "9999 sat/vB" = 11 chars.
-    let fee_str = if fee_sat_vb >= 100.0 {
+    // Three tiers to keep the left column ≤ 11 characters in all realistic scenarios.
+    let fee_str = if fee_sat_vb >= 10_000.0 {
+        format!("{:.0}k sat/vB", fee_sat_vb / 1_000.0)
+    } else if fee_sat_vb >= 100.0 {
         format!("{:.0} sat/vB", fee_sat_vb)
     } else {
         format!("{:.1} sat/vB", fee_sat_vb)
@@ -119,6 +127,23 @@ mod tests {
         assert!(s.starts_with("1.0 sat/vB"));
     }
 
+    #[test]
+    fn fee_peers_high_fee_kilo_tier() {
+        // ≥ 10_000 sat/vB switches to k-unit to stay within 11 chars
+        let s = format_fee_peers(10_000.0, 5);
+        assert_eq!(s.len(), 20);
+        assert!(s.starts_with("10k sat/vB"));
+        assert!(s.ends_with("5 peers"));
+    }
+
+    #[test]
+    fn fee_peers_high_fee_large_kilo() {
+        // 100_000 sat/vB → "100k sat/vB" = 11 chars — still fits
+        let s = format_fee_peers(100_000.0, 1);
+        assert_eq!(s.len(), 20);
+        assert!(s.starts_with("100k sat/vB"));
+    }
+
     // ── format_lines_bitcoin ─────────────────────────────────────────────────
 
     fn sample_block() -> (u64, &'static str, u64) {
@@ -146,8 +171,16 @@ mod tests {
 
     #[test]
     fn format_lines_bitcoin_out_of_range_timestamp() {
-        // Timestamp far beyond NaiveDateTime::MAX (~year 262_143) → chrono returns None
+        // Timestamp far beyond NaiveDateTime::MAX (~year 262_143) → chrono returns None.
+        // u64::MAX / 2 == i64::MAX, which converts cleanly but exceeds DateTime range.
         let (height, hash, _) = sample_block();
         assert!(format_lines_bitcoin(height, hash, u64::MAX / 2, 1.0, 0).is_err());
+    }
+
+    #[test]
+    fn format_lines_bitcoin_timestamp_i64_overflow() {
+        // timestamp fits u64 but not i64 → i64::try_from fails
+        let (height, hash, _) = sample_block();
+        assert!(format_lines_bitcoin(height, hash, u64::MAX, 1.0, 0).is_err());
     }
 }
