@@ -413,6 +413,7 @@ dependencies = [
 name = "lcd-odroid"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "hd44780-driver",
  "linux-embedded-hal",
