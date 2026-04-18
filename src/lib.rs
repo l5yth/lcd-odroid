@@ -40,7 +40,11 @@ pub const LINE4: u8 = 0x54;
 /// recent header rather than flooding the display with intermediate blocks.
 pub const THROTTLE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Slot duration on all mainnet-derived Ethereum networks.
+/// Slot duration on Ethereum mainnet.
+///
+/// This value is hardcoded rather than fetched from `/eth/v1/config/spec`
+/// because the daemon targets a single known deployment. Some testnets and
+/// devnets use a different slot interval.
 pub const SECONDS_PER_SLOT: u64 = 12;
 
 /// Read-timeout applied to the WebSocket connection.
@@ -111,7 +115,9 @@ pub fn format_lines(
         format!("#{}", group_underscore(number))
     );
     // First 20 hex characters of the block hash (the "0x" prefix is included in the count).
-    let line2: String = hash.chars().take(20).collect();
+    // Padded with spaces if the hash is somehow shorter than 20 chars so the LCD line
+    // length invariant is maintained and stale characters are not left on the display.
+    let line2 = format!("{:<20}", hash.chars().take(20).collect::<String>());
     // UTC wall-clock time — "%Y-%m-%d %H:%M:%SZ" is always exactly 20 characters.
     let line3 = DateTime::from_timestamp(timestamp as i64, 0)
         .ok_or("bad timestamp")?
@@ -128,14 +134,15 @@ pub fn format_lines(
 ///
 /// | Row | Content |
 /// |-----|---------|
-/// | 1   | `"Slot     #21_833_152"` – slot number right-aligned to 20 chars |
-/// | 2   | First 20 characters of the block root (includes `0x` prefix) |
+/// | 1   | `"Slot     #21_833_152"` – label left, slot number right-aligned in 15 chars |
+/// | 2   | First 20 characters of the block root (includes `0x` prefix), space-padded |
 /// | 3   | Slot timestamp (`genesis_time + slot × 12 s`) as `YYYY-MM-DD HH:MM:SSZ` |
 /// | 4   | Attestation count and peer count, padded to 20 chars |
 ///
 /// # Errors
-/// Returns an error if the computed timestamp is outside the valid [`DateTime`]
-/// range (requires a slot number far beyond any realistic future value).
+/// Returns an error if the slot-to-timestamp arithmetic overflows, if the
+/// timestamp value cannot be represented as [`i64`], or if the timestamp is
+/// outside the valid [`DateTime`] range.
 pub fn format_lines_consensus(
     slot: u64,
     block_root: &str,
@@ -145,7 +152,12 @@ pub fn format_lines_consensus(
 ) -> Result<[String; 4], Box<dyn std::error::Error>> {
     // Slot timestamp derived from the chain genesis rather than a field in the
     // event, since the SSE head payload does not include a timestamp.
-    let timestamp = genesis_time + slot * SECONDS_PER_SLOT;
+    // Use checked arithmetic so overflow is an explicit error rather than silent wrap.
+    let slot_secs = slot.checked_mul(SECONDS_PER_SLOT).ok_or("slot overflow")?;
+    let timestamp = genesis_time
+        .checked_add(slot_secs)
+        .ok_or("timestamp overflow")?;
+    let ts_i64 = i64::try_from(timestamp).map_err(|_| "timestamp out of i64 range")?;
 
     // Label left-justified in 5 chars; slot number right-justified in 15.
     let line1 = format!(
@@ -154,9 +166,10 @@ pub fn format_lines_consensus(
         format!("#{}", group_underscore(slot))
     );
     // First 20 hex characters of the block root (the "0x" prefix is included).
-    let line2: String = block_root.chars().take(20).collect();
+    // Space-padded to maintain the 20-char invariant if the root is unusually short.
+    let line2 = format!("{:<20}", block_root.chars().take(20).collect::<String>());
     // UTC wall-clock time — always exactly 20 characters.
-    let line3 = DateTime::from_timestamp(timestamp as i64, 0)
+    let line3 = DateTime::from_timestamp(ts_i64, 0)
         .ok_or("bad timestamp")?
         .format("%Y-%m-%d %H:%M:%SZ")
         .to_string();
@@ -600,9 +613,27 @@ mod tests {
 
     #[test]
     fn format_lines_consensus_out_of_range_timestamp() {
-        // genesis + slot * 12 > NaiveDateTime::MAX (~year 262143) → error
+        // genesis + slot * 12 > NaiveDateTime::MAX (~year 262143) → DateTime returns None
         let (_, root, genesis) = sample_consensus_head();
         assert!(format_lines_consensus(700_000_000_000, root, genesis, 0, 0).is_err());
+    }
+
+    #[test]
+    fn format_lines_consensus_slot_mul_overflow() {
+        // slot * SECONDS_PER_SLOT overflows u64 → checked_mul returns None
+        assert!(format_lines_consensus(u64::MAX / 12 + 1, "0xabc", 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn format_lines_consensus_timestamp_add_overflow() {
+        // genesis_time + slot_secs overflows u64 → checked_add returns None
+        assert!(format_lines_consensus(1, "0xabc", u64::MAX - 11, 0, 0).is_err());
+    }
+
+    #[test]
+    fn format_lines_consensus_timestamp_i64_overflow() {
+        // timestamp fits u64 but not i64 → i64::try_from fails
+        assert!(format_lines_consensus(0, "0xabc", u64::MAX, 0, 0).is_err());
     }
 
     // ── parse_sse_head ───────────────────────────────────────────────────────

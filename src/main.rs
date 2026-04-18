@@ -203,9 +203,8 @@ fn render_consensus<B: DataBus>(
     // Peer count is a decimal string (unlike EL hex quantities).
     let peers: u64 = cl_get("/eth/v1/node/peer_count")?["data"]["connected"]
         .as_str()
-        .unwrap_or("0")
-        .parse()
-        .unwrap_or(0);
+        .ok_or("missing peer count")?
+        .parse()?;
     let lines = format_lines_consensus(slot, block_root, genesis_time, att_count, peers)?;
     write_display(lcd, &lines)
 }
@@ -213,9 +212,10 @@ fn render_consensus<B: DataBus>(
 /// Runs the consensus-layer display loop.
 ///
 /// Fetches the chain genesis time and current head once on startup, then
-/// subscribes to `head` events over the Beacon Node SSE endpoint. Events are
-/// latched into a `pending` slot and the display is updated at most once per
-/// [`THROTTLE`] second.
+/// subscribes to `head` events over the Beacon Node SSE endpoint. Each `data:`
+/// line triggers an immediate render — no throttle is needed because Ethereum
+/// slots are 12 seconds apart and burst events do not occur on the consensus
+/// layer the way reorgs can on the execution layer.
 fn run_consensus<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::error::Error>> {
     // Genesis time is needed to convert slot numbers to wall-clock timestamps.
     let genesis_time: u64 = cl_get("/eth/v1/config/genesis")?["data"]["genesis_time"]
@@ -236,27 +236,17 @@ fn run_consensus<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::err
         .to_string();
     render_consensus(lcd, init_slot, &init_root, genesis_time)?;
     info!("initial render: slot #{}", group_underscore(init_slot));
-    let mut last_render = Instant::now();
 
     // Subscribe to head events via the Beacon Node SSE endpoint.
     let resp = ureq::get(&format!("{CL_HTTP_URL}/eth/v1/events?topics=head")).call()?;
     info!("subscribed to head SSE at {CL_HTTP_URL}");
 
     let reader = BufReader::new(resp.into_reader());
-    let mut pending: Option<(u64, String)> = None;
-
     for line_result in reader.lines() {
         let line = line_result?;
-        if let Some(head) = parse_sse_head(&line)? {
-            info!("received slot #{} from SSE", group_underscore(head.0));
-            pending = Some(head);
-        }
-        // The blank-line separator after each SSE event provides a natural tick
-        // to drain pending; apply the throttle to collapse any rapid-fire events.
-        if pending.is_some() && last_render.elapsed() >= THROTTLE {
-            let (slot, block_root) = pending.take().unwrap();
+        if let Some((slot, block_root)) = parse_sse_head(&line)? {
+            info!("received slot #{} from SSE", group_underscore(slot));
             render_consensus(lcd, slot, &block_root, genesis_time)?;
-            last_render = Instant::now();
             info!("updated lcd to slot #{}", group_underscore(slot));
         }
     }
