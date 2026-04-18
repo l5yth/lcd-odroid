@@ -17,8 +17,18 @@
 //! Intentionally hardware-free: all functions operate on plain Rust values and
 //! the [`LcdDisplay`] trait so that the full rendering pipeline can be unit-
 //! tested without a physical I²C bus or a running Ethereum node.
+//!
+//! Layer-specific logic lives in submodules that are re-exported here so
+//! callers can use a flat `use lcd_odroid::*` import.
 
-use chrono::DateTime;
+pub mod bitcoin;
+pub mod consensus;
+pub mod execution;
+
+pub use bitcoin::*;
+pub use consensus::*;
+pub use execution::*;
+
 use serde_json::Value;
 
 // ── HD44780 row addresses ────────────────────────────────────────────────────
@@ -93,151 +103,6 @@ pub fn write_display(
     Ok(())
 }
 
-/// Formats the four LCD lines from a block `header` plus current network state.
-///
-/// | Row | Content |
-/// |-----|---------|
-/// | 1   | `"Block   #21_000_000"` – block number right-aligned to 20 chars |
-/// | 2   | First 20 characters of the block hash (includes `0x` prefix) |
-/// | 3   | Block timestamp formatted as `YYYY-MM-DD HH:MM:SSZ` (exactly 20 chars) |
-/// | 4   | Gas price in gwei and peer count, padded to 20 chars |
-///
-/// # Errors
-/// Returns an error if `header` is missing the `number`, `hash`, or `timestamp`
-/// field, if any field cannot be hex-decoded, or if the timestamp is outside
-/// the valid [`DateTime`] range.
-pub fn format_lines(
-    header: &Value,
-    gas_wei: u64,
-    peers: u64,
-) -> Result<[String; 4], Box<dyn std::error::Error>> {
-    let number = parse_hex_u64(header["number"].as_str().ok_or("number")?)?;
-    let hash = header["hash"].as_str().ok_or("hash")?;
-    let timestamp = parse_hex_u64(header["timestamp"].as_str().ok_or("timestamp")?)?;
-
-    // Label left-justified in 5 chars; number right-justified in the remaining 15.
-    let line1 = format!(
-        "{:<5}{:>15}",
-        "Block",
-        format!("#{}", group_underscore(number))
-    );
-    // First 20 hex characters of the block hash (the "0x" prefix is included in the count).
-    // Padded with spaces if the hash is somehow shorter than 20 chars so the LCD line
-    // length invariant is maintained and stale characters are not left on the display.
-    let line2 = format!("{:<20}", hash.chars().take(20).collect::<String>());
-    // UTC wall-clock time — "%Y-%m-%d %H:%M:%SZ" is always exactly 20 characters.
-    let line3 = DateTime::from_timestamp(timestamp as i64, 0)
-        .ok_or("bad timestamp")?
-        .format("%Y-%m-%d %H:%M:%SZ")
-        .to_string();
-    let line4 = format_gas_peers(gas_wei, peers);
-
-    Ok([line1, line2, line3, line4])
-}
-
-// ── Consensus-layer display ──────────────────────────────────────────────────
-
-/// Formats the four LCD lines from consensus-layer head data.
-///
-/// | Row | Content |
-/// |-----|---------|
-/// | 1   | `"Slot     #21_833_152"` – label left, slot number right-aligned in 15 chars |
-/// | 2   | First 20 characters of the block root (includes `0x` prefix), space-padded |
-/// | 3   | Slot timestamp (`genesis_time + slot × 12 s`) as `YYYY-MM-DD HH:MM:SSZ` |
-/// | 4   | Attestation count and peer count, padded to 20 chars |
-///
-/// # Errors
-/// Returns an error if the slot-to-timestamp arithmetic overflows, if the
-/// timestamp value cannot be represented as [`i64`], or if the timestamp is
-/// outside the valid [`DateTime`] range.
-pub fn format_lines_consensus(
-    slot: u64,
-    block_root: &str,
-    genesis_time: u64,
-    att_count: usize,
-    peers: u64,
-) -> Result<[String; 4], Box<dyn std::error::Error>> {
-    // Slot timestamp derived from the chain genesis rather than a field in the
-    // event, since the SSE head payload does not include a timestamp.
-    // Use checked arithmetic so overflow is an explicit error rather than silent wrap.
-    let slot_secs = slot.checked_mul(SECONDS_PER_SLOT).ok_or("slot overflow")?;
-    let timestamp = genesis_time
-        .checked_add(slot_secs)
-        .ok_or("timestamp overflow")?;
-    let ts_i64 = i64::try_from(timestamp).map_err(|_| "timestamp out of i64 range")?;
-
-    // Label left-justified in 5 chars; slot number right-justified in 15.
-    let line1 = format!(
-        "{:<5}{:>15}",
-        "Slot",
-        format!("#{}", group_underscore(slot))
-    );
-    // First 20 hex characters of the block root (the "0x" prefix is included).
-    // Space-padded to maintain the 20-char invariant if the root is unusually short.
-    let line2 = format!("{:<20}", block_root.chars().take(20).collect::<String>());
-    // UTC wall-clock time — always exactly 20 characters.
-    let line3 = DateTime::from_timestamp(ts_i64, 0)
-        .ok_or("bad timestamp")?
-        .format("%Y-%m-%d %H:%M:%SZ")
-        .to_string();
-    let line4 = format_atts_peers(att_count, peers);
-
-    Ok([line1, line2, line3, line4])
-}
-
-/// Formats the attestation-count / peer-count status line to exactly 20 characters.
-///
-/// The left column (11 chars) shows the number of attestations included in the
-/// block. The right column (9 chars) shows the connected peer count, right-aligned.
-pub fn format_atts_peers(att_count: usize, peers: u64) -> String {
-    let att_str = format!("{} atts", att_count);
-    let peer_str = format!("{} peers", peers);
-    format!("{:<11}{:>9}", att_str, peer_str)
-}
-
-// ── SSE message parsing ──────────────────────────────────────────────────────
-
-/// Parses one line from a Beacon Node SSE stream and returns `(slot, block_root)`
-/// if the line is a `data:` payload for a `head` event.
-///
-/// Returns `Ok(None)` for non-`data:` lines (e.g. `event:` or blank separator
-/// lines), so callers can feed every line from a [`std::io::BufRead`] iterator directly.
-///
-/// # Errors
-/// Returns an error if the `data:` payload is not valid JSON, or if the
-/// expected `slot` or `block` fields are absent or malformed.
-pub fn parse_sse_head(line: &str) -> Result<Option<(u64, String)>, Box<dyn std::error::Error>> {
-    let json_str = match line.strip_prefix("data: ") {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-    let v: Value = serde_json::from_str(json_str)?;
-    let slot = v["slot"].as_str().ok_or("missing slot")?.parse::<u64>()?;
-    let block_root = v["block"].as_str().ok_or("missing block root")?.to_string();
-    Ok(Some((slot, block_root)))
-}
-
-// ── WebSocket message parsing ────────────────────────────────────────────────
-
-/// Parses a JSON WebSocket message and returns the block header embedded in an
-/// `eth_subscription` notification, if present.
-///
-/// Returns `Ok(None)` for any message that is not an `eth_subscription`
-/// notification — most importantly the subscription-confirmation reply that
-/// geth sends immediately after the `eth_subscribe` call.
-///
-/// # Errors
-/// Returns `Err` if `text` is not valid JSON.
-pub fn extract_new_head(text: &str) -> Result<Option<Value>, serde_json::Error> {
-    let v: Value = serde_json::from_str(text)?;
-    if v.get("method").and_then(|m| m.as_str()) == Some("eth_subscription") {
-        // `params.result` holds the new block header; absent on malformed messages.
-        Ok(v["params"].get("result").cloned())
-    } else {
-        Ok(None)
-    }
-}
-
 // ── Parsing helpers ──────────────────────────────────────────────────────────
 
 /// Parses a `0x`-prefixed (or bare) hexadecimal string into a [`u64`].
@@ -286,29 +151,11 @@ pub fn group_underscore(n: u64) -> String {
     out
 }
 
-/// Formats the gas-price / peer-count status line to exactly 20 characters.
-///
-/// The left column (11 chars) shows the current gas price in gwei:
-/// two decimal places when below 100 gwei, no decimal places at or above.
-/// The right column (9 chars) shows the connected peer count, right-aligned.
-pub fn format_gas_peers(gas_wei: u64, peers: u64) -> String {
-    let gwei = gas_wei as f64 / 1e9;
-    // Omit decimals at high values so the column stays within 11 characters.
-    let gas_str = if gwei >= 100.0 {
-        format!("{:.0} gwei", gwei)
-    } else {
-        format!("{:.2} gwei", gwei)
-    };
-    let peer_str = format!("{} peers", peers);
-    format!("{:<11}{:>9}", gas_str, peer_str)
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     // ── LcdDisplay mocks ─────────────────────────────────────────────────────
 
@@ -407,107 +254,17 @@ mod tests {
 
     #[test]
     fn block_number_valid() {
-        assert_eq!(block_number(&json!({"number": "0x100"})), 256);
+        assert_eq!(block_number(&serde_json::json!({"number": "0x100"})), 256);
     }
 
     #[test]
     fn block_number_missing_field() {
-        assert_eq!(block_number(&json!({})), 0);
+        assert_eq!(block_number(&serde_json::json!({})), 0);
     }
 
     #[test]
     fn block_number_invalid_hex() {
-        assert_eq!(block_number(&json!({"number": "not_hex"})), 0);
-    }
-
-    // ── format_gas_peers ─────────────────────────────────────────────────────
-
-    #[test]
-    fn gas_peers_below_100_gwei() {
-        let s = format_gas_peers(1_500_000_000, 42);
-        assert_eq!(s.len(), 20);
-        assert!(s.starts_with("1.50 gwei"));
-        assert!(s.ends_with("42 peers"));
-    }
-
-    #[test]
-    fn gas_peers_exactly_100_gwei() {
-        let s = format_gas_peers(100_000_000_000, 0);
-        assert_eq!(s.len(), 20);
-        assert!(s.starts_with("100 gwei"));
-    }
-
-    #[test]
-    fn gas_peers_above_100_gwei() {
-        let s = format_gas_peers(200_000_000_000, 5);
-        assert_eq!(s.len(), 20);
-        assert!(s.starts_with("200 gwei"));
-        assert!(s.ends_with("5 peers"));
-    }
-
-    // ── format_lines ─────────────────────────────────────────────────────────
-
-    fn sample_header() -> Value {
-        json!({
-            "number": "0x1400000",    // 20_971_520
-            "hash":   "0xabcdef1234567890abcdef1234567890abcdef12",
-            "timestamp": "0x67b9a480" // 2025-02-22 (approx)
-        })
-    }
-
-    #[test]
-    fn format_lines_happy_path() {
-        let lines = format_lines(&sample_header(), 1_500_000_000, 42).unwrap();
-        // Row 1: "Block" + right-justified block number
-        assert_eq!(lines[0], "Block    #20_971_520");
-        // Row 2: first 20 chars of the hash string
-        assert_eq!(lines[1], "0xabcdef1234567890ab");
-        // Row 3: ISO-8601 UTC timestamp
-        assert_eq!(lines[2].len(), 20);
-        assert!(lines[2].ends_with('Z'));
-        // Row 4: gas + peers
-        assert_eq!(lines[3].len(), 20);
-        // All rows exactly 20 chars
-        for line in &lines {
-            assert_eq!(line.len(), 20, "line not 20 chars: {line:?}");
-        }
-    }
-
-    #[test]
-    fn format_lines_missing_number() {
-        let h = json!({"hash": "0xabc", "timestamp": "0x1"});
-        assert!(format_lines(&h, 0, 0).is_err());
-    }
-
-    #[test]
-    fn format_lines_invalid_number_hex() {
-        let h = json!({"number": "xyz", "hash": "0xabc", "timestamp": "0x1"});
-        assert!(format_lines(&h, 0, 0).is_err());
-    }
-
-    #[test]
-    fn format_lines_missing_hash() {
-        let h = json!({"number": "0x1", "timestamp": "0x1"});
-        assert!(format_lines(&h, 0, 0).is_err());
-    }
-
-    #[test]
-    fn format_lines_missing_timestamp() {
-        let h = json!({"number": "0x1", "hash": "0xabc"});
-        assert!(format_lines(&h, 0, 0).is_err());
-    }
-
-    #[test]
-    fn format_lines_invalid_timestamp_hex() {
-        let h = json!({"number": "0x1", "hash": "0xabc", "timestamp": "xyz"});
-        assert!(format_lines(&h, 0, 0).is_err());
-    }
-
-    #[test]
-    fn format_lines_out_of_range_timestamp() {
-        // i64::MAX seconds >> NaiveDateTime::MAX (~year 262143) → chrono returns None
-        let h = json!({"number": "0x1", "hash": "0xabcdef1234567890ab", "timestamp": "0x7fffffffffffffff"});
-        assert!(format_lines(&h, 0, 0).is_err());
+        assert_eq!(block_number(&serde_json::json!({"number": "not_hex"})), 0);
     }
 
     // ── write_display ────────────────────────────────────────────────────────
@@ -538,150 +295,5 @@ mod tests {
             "d".to_string(),
         ];
         assert!(write_display(&mut FailLcd, &lines).is_err());
-    }
-
-    // ── extract_new_head ─────────────────────────────────────────────────────
-
-    #[test]
-    fn extract_new_head_returns_header() {
-        let msg = r#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x1","result":{"number":"0x100"}}}"#;
-        let head = extract_new_head(msg).unwrap().unwrap();
-        assert_eq!(head["number"], "0x100");
-    }
-
-    #[test]
-    fn extract_new_head_subscription_no_result() {
-        // Malformed subscription with no result field → Ok(None)
-        let msg =
-            r#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x1"}}"#;
-        assert!(extract_new_head(msg).unwrap().is_none());
-    }
-
-    #[test]
-    fn extract_new_head_non_subscription_returns_none() {
-        // Subscription-confirmation reply, not a notification
-        let msg = r#"{"jsonrpc":"2.0","id":1,"result":"0xsub123"}"#;
-        assert!(extract_new_head(msg).unwrap().is_none());
-    }
-
-    #[test]
-    fn extract_new_head_invalid_json() {
-        assert!(extract_new_head("not valid json {{").is_err());
-    }
-
-    // ── format_atts_peers ────────────────────────────────────────────────────
-
-    #[test]
-    fn atts_peers_typical() {
-        let s = format_atts_peers(128, 42);
-        assert_eq!(s.len(), 20);
-        assert!(s.starts_with("128 atts"));
-        assert!(s.ends_with("42 peers"));
-    }
-
-    #[test]
-    fn atts_peers_zero_atts() {
-        let s = format_atts_peers(0, 0);
-        assert_eq!(s.len(), 20);
-        assert!(s.starts_with("0 atts"));
-    }
-
-    #[test]
-    fn atts_peers_post_electra_count() {
-        // Post-Electra max attestations per block is 8 (EIP-7549 consolidation)
-        let s = format_atts_peers(8, 100);
-        assert_eq!(s.len(), 20);
-        assert!(s.starts_with("8 atts"));
-    }
-
-    // ── format_lines_consensus ───────────────────────────────────────────────
-
-    fn sample_consensus_head() -> (u64, &'static str, u64) {
-        (
-            21_833_152,                                       // slot
-            "0x0123456789abcdef01234567890abcdef01234567890", // block_root (>20 chars)
-            1_606_824_023,                                    // genesis_time (mainnet)
-        )
-    }
-
-    #[test]
-    fn format_lines_consensus_happy_path() {
-        let (slot, root, genesis) = sample_consensus_head();
-        let lines = format_lines_consensus(slot, root, genesis, 128, 42).unwrap();
-        assert_eq!(lines[0], "Slot     #21_833_152");
-        assert_eq!(lines[1], "0x0123456789abcdef01");
-        assert_eq!(lines[2].len(), 20);
-        assert!(lines[2].ends_with('Z'));
-        assert_eq!(lines[3], "128 atts    42 peers");
-        for line in &lines {
-            assert_eq!(line.len(), 20, "line not 20 chars: {line:?}");
-        }
-    }
-
-    #[test]
-    fn format_lines_consensus_out_of_range_timestamp() {
-        // slot=700B, slot*12=8.4T and genesis+slot*12≈8.4T both fit in u64 and i64,
-        // but the resulting timestamp (~year 266_000) exceeds NaiveDateTime::MAX
-        // (~year 262_143) so DateTime::from_timestamp returns None → "bad timestamp".
-        let (_, root, genesis) = sample_consensus_head();
-        assert!(format_lines_consensus(700_000_000_000, root, genesis, 0, 0).is_err());
-    }
-
-    #[test]
-    fn format_lines_consensus_slot_mul_overflow() {
-        // slot * SECONDS_PER_SLOT overflows u64 → checked_mul returns None
-        assert!(format_lines_consensus(u64::MAX / 12 + 1, "0xabc", 0, 0, 0).is_err());
-    }
-
-    #[test]
-    fn format_lines_consensus_timestamp_add_overflow() {
-        // genesis_time + slot_secs overflows u64 → checked_add returns None
-        assert!(format_lines_consensus(1, "0xabc", u64::MAX - 11, 0, 0).is_err());
-    }
-
-    #[test]
-    fn format_lines_consensus_timestamp_i64_overflow() {
-        // timestamp fits u64 but not i64 → i64::try_from fails
-        assert!(format_lines_consensus(0, "0xabc", u64::MAX, 0, 0).is_err());
-    }
-
-    // ── parse_sse_head ───────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_sse_head_returns_slot_and_root() {
-        let line = r#"data: {"slot":"21833152","block":"0x0123456789abcdef","state":"0xabc","epoch_transition":false}"#;
-        let (slot, root) = parse_sse_head(line).unwrap().unwrap();
-        assert_eq!(slot, 21_833_152);
-        assert_eq!(root, "0x0123456789abcdef");
-    }
-
-    #[test]
-    fn parse_sse_head_event_line_returns_none() {
-        assert!(parse_sse_head("event: head").unwrap().is_none());
-    }
-
-    #[test]
-    fn parse_sse_head_blank_line_returns_none() {
-        assert!(parse_sse_head("").unwrap().is_none());
-    }
-
-    #[test]
-    fn parse_sse_head_invalid_json() {
-        assert!(parse_sse_head("data: not_json{{").is_err());
-    }
-
-    #[test]
-    fn parse_sse_head_missing_slot() {
-        assert!(parse_sse_head(r#"data: {"block":"0x123"}"#).is_err());
-    }
-
-    #[test]
-    fn parse_sse_head_missing_block() {
-        assert!(parse_sse_head(r#"data: {"slot":"123"}"#).is_err());
-    }
-
-    #[test]
-    fn parse_sse_head_invalid_slot_value() {
-        assert!(parse_sse_head(r#"data: {"slot":"not_a_number","block":"0x123"}"#).is_err());
     }
 }

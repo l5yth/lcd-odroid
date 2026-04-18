@@ -17,11 +17,12 @@ use std::io::{self, BufRead, BufReader};
 use std::net::TcpStream;
 use std::time::Instant;
 
+use base64::Engine as _;
 use hd44780_driver::{Cursor, CursorBlink, Display, DisplayMode, HD44780, bus::DataBus};
 use lcd_odroid::{
     LcdDisplay, READ_TIMEOUT, SSE_READ_TIMEOUT, THROTTLE, block_number, extract_new_head,
-    format_lines, format_lines_consensus, group_underscore, parse_hex_u64, parse_sse_head,
-    write_display,
+    format_lines, format_lines_bitcoin, format_lines_consensus, group_underscore, parse_hex_u64,
+    parse_sse_head, write_display,
 };
 use linux_embedded_hal::{Delay, I2cdev};
 use serde_json::{Value, json};
@@ -35,6 +36,8 @@ const HTTP_URL: &str = "http://127.0.0.1:8545";
 const WS_URL: &str = "ws://127.0.0.1:8546";
 /// Beacon Node REST API endpoint (Lighthouse default port).
 const CL_HTTP_URL: &str = "http://127.0.0.1:5052";
+/// Bitcoin Core JSON-RPC HTTP endpoint.
+const BTC_HTTP_URL: &str = "http://127.0.0.1:8332";
 
 /// Logs a timestamped INFO line to stderr.
 macro_rules! info {
@@ -193,6 +196,110 @@ fn cl_get(path: &str) -> Result<Value, Box<dyn std::error::Error>> {
         .into_json()?)
 }
 
+/// Sends a JSON-RPC 1.0 request to the Bitcoin Core node and returns the `result` field.
+///
+/// Credentials are passed as HTTP Basic Auth; the `Authorization` header is
+/// constructed from `user` and `pass` at call time.
+///
+/// # Errors
+/// Returns an error if the HTTP request fails, the response is not valid JSON,
+/// or the response contains a non-null `error` object.
+fn rpc_btc(
+    method: &str,
+    params: Value,
+    user: &str,
+    pass: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+    );
+    let body = json!({ "jsonrpc": "1.0", "id": 1, "method": method, "params": params });
+    let resp: Value = ureq::post(BTC_HTTP_URL)
+        .set("Authorization", &auth)
+        .send_json(body)?
+        .into_json()?;
+    if !resp["error"].is_null() {
+        return Err(format!("rpc {method}: {}", resp["error"]).into());
+    }
+    Ok(resp["result"].clone())
+}
+
+/// Fetches current fee rate and peer count from the Bitcoin node, formats all
+/// four lines, and writes them to the display.
+///
+/// # Errors
+/// Returns an error if any Bitcoin Core RPC request fails, a required response
+/// field is absent, [`format_lines_bitcoin`] returns an error, or the LCD write fails.
+fn render_bitcoin<B: DataBus>(
+    lcd: &mut I2cLcd<B>,
+    height: u64,
+    hash: &str,
+    timestamp: u64,
+    user: &str,
+    pass: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Estimate next-block fee rate in sat/vByte from Bitcoin Core's fee estimator.
+    // `feerate` is in BTC/kB; multiply by 1e5 to convert to sat/vByte.
+    let fee_result = rpc_btc("estimatesmartfee", json!([1, "ECONOMICAL"]), user, pass)?;
+    let fee_sat_vb = if let Some(feerate) = fee_result["feerate"].as_f64() {
+        feerate * 1e5
+    } else {
+        // Insufficient chain data for the estimator (common on fresh nodes).
+        // Fall back to the mempool minimum fee; default to 1.0 if also unavailable.
+        rpc_btc("getmempoolinfo", json!([]), user, pass)?["mempoolminfee"]
+            .as_f64()
+            .map(|f| f * 1e5)
+            .unwrap_or(1.0)
+    };
+    let peers = rpc_btc("getnetworkinfo", json!([]), user, pass)?["connections"]
+        .as_u64()
+        .ok_or("missing connections")?;
+    let lines = format_lines_bitcoin(height, hash, timestamp, fee_sat_vb, peers)?;
+    write_display(lcd, &lines)
+}
+
+/// Runs the Bitcoin display loop.
+///
+/// Performs an initial render from the current chain tip, then long-polls
+/// [`waitfornewblock`](https://developer.bitcoin.org/reference/rpc/waitfornewblock.html)
+/// with a 60-second timeout. The display is updated whenever the block hash changes;
+/// timeouts that return the same hash are ignored.
+fn run_bitcoin<B: DataBus>(
+    lcd: &mut I2cLcd<B>,
+    user: &str,
+    pass: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Fetch the current chain tip for the initial render.
+    let info = rpc_btc("getblockchaininfo", json!([]), user, pass)?;
+    let best_hash = info["bestblockhash"]
+        .as_str()
+        .ok_or("missing bestblockhash")?
+        .to_string();
+    let tip = rpc_btc("getblock", json!([best_hash, 1]), user, pass)?;
+    let init_height = tip["height"].as_u64().ok_or("missing height")?;
+    let init_time = tip["time"].as_u64().ok_or("missing time")?;
+    render_bitcoin(lcd, init_height, &best_hash, init_time, user, pass)?;
+    info!("initial render: block #{}", group_underscore(init_height));
+
+    let mut last_hash = best_hash;
+    loop {
+        // waitfornewblock blocks until a new block arrives or the timeout expires.
+        // It always returns the current best, so we compare against last_hash to
+        // distinguish a new block from a timeout with no new block.
+        let res = rpc_btc("waitfornewblock", json!([60_000]), user, pass)?;
+        let new_hash = res["hash"].as_str().ok_or("missing hash")?.to_string();
+        if new_hash != last_hash {
+            let block = rpc_btc("getblock", json!([new_hash, 1]), user, pass)?;
+            let height = block["height"].as_u64().ok_or("missing height")?;
+            let timestamp = block["time"].as_u64().ok_or("missing time")?;
+            render_bitcoin(lcd, height, &new_hash, timestamp, user, pass)?;
+            info!("updated lcd to block #{}", group_underscore(height));
+            last_hash = new_hash;
+        }
+    }
+}
+
 /// Fetches attestation count and peer count from the Beacon Node, formats all
 /// four lines, and writes them to the display.
 ///
@@ -306,6 +413,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match layer {
         "execution" => run_execution(&mut lcd),
         "consensus" => run_consensus(&mut lcd),
+        "bitcoin" => {
+            let user = cfg
+                .get("rpcuser")
+                .and_then(|v| v.as_str())
+                .ok_or("config.toml: missing 'rpcuser'")?;
+            let pass = cfg
+                .get("rpcpassword")
+                .and_then(|v| v.as_str())
+                .ok_or("config.toml: missing 'rpcpassword'")?;
+            run_bitcoin(&mut lcd, user, pass)
+        }
         other => Err(format!("config.toml: unsupported type {other:?}").into()),
     }
 }

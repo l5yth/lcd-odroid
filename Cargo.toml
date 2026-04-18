@@ -10,6 +10,7 @@ edition = "2024"
 hd44780-driver = "0.4"
 linux-embedded-hal = "0.3"
 ureq = { version = "2", default-features = false, features = ["json"] }
+base64 = { version = "0.22", default-features = false }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
