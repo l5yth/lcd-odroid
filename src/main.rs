@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::net::TcpStream;
 use std::time::Instant;
 
 use hd44780_driver::{Cursor, CursorBlink, Display, DisplayMode, HD44780, bus::DataBus};
 use lcd_odroid::{
     LcdDisplay, READ_TIMEOUT, THROTTLE, block_number, extract_new_head, format_lines,
-    group_underscore, parse_hex_u64, write_display,
+    format_lines_consensus, group_underscore, parse_hex_u64, parse_sse_head, write_display,
 };
 use linux_embedded_hal::{Delay, I2cdev};
 use serde_json::{Value, json};
@@ -32,6 +32,8 @@ const CONFIG_PATH: &str = "config.toml";
 const HTTP_URL: &str = "http://127.0.0.1:8545";
 /// WebSocket endpoint used for `eth_subscribe` / `newHeads`.
 const WS_URL: &str = "ws://127.0.0.1:8546";
+/// Beacon Node REST API endpoint (Lighthouse default port).
+const CL_HTTP_URL: &str = "http://127.0.0.1:5052";
 
 /// Logs a timestamped INFO line to stderr.
 macro_rules! info {
@@ -175,6 +177,93 @@ fn set_read_timeout(
     Ok(())
 }
 
+/// Sends a GET request to the Beacon Node REST API and returns the parsed JSON.
+///
+/// # Errors
+/// Returns an error if the HTTP request fails or the response is not valid JSON.
+fn cl_get(path: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    Ok(ureq::get(&format!("{CL_HTTP_URL}{path}"))
+        .call()?
+        .into_json()?)
+}
+
+/// Fetches attestation count and peer count from the Beacon Node, formats all
+/// four lines, and writes them to the display.
+fn render_consensus<B: DataBus>(
+    lcd: &mut I2cLcd<B>,
+    slot: u64,
+    block_root: &str,
+    genesis_time: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Count attestations from the block body.
+    let block = cl_get(&format!("/eth/v2/beacon/blocks/{block_root}"))?;
+    let att_count = block["data"]["message"]["body"]["attestations"]
+        .as_array()
+        .map_or(0, |a| a.len());
+    // Peer count is a decimal string (unlike EL hex quantities).
+    let peers: u64 = cl_get("/eth/v1/node/peer_count")?["data"]["connected"]
+        .as_str()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
+    let lines = format_lines_consensus(slot, block_root, genesis_time, att_count, peers)?;
+    write_display(lcd, &lines)
+}
+
+/// Runs the consensus-layer display loop.
+///
+/// Fetches the chain genesis time and current head once on startup, then
+/// subscribes to `head` events over the Beacon Node SSE endpoint. Events are
+/// latched into a `pending` slot and the display is updated at most once per
+/// [`THROTTLE`] second.
+fn run_consensus<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::error::Error>> {
+    // Genesis time is needed to convert slot numbers to wall-clock timestamps.
+    let genesis_time: u64 = cl_get("/eth/v1/config/genesis")?["data"]["genesis_time"]
+        .as_str()
+        .ok_or("missing genesis_time")?
+        .parse()?;
+    info!("genesis_time={genesis_time}");
+
+    // Initial render from the current chain head.
+    let head = cl_get("/eth/v1/beacon/headers/head")?;
+    let init_slot: u64 = head["data"]["header"]["message"]["slot"]
+        .as_str()
+        .ok_or("missing slot")?
+        .parse()?;
+    let init_root = head["data"]["root"]
+        .as_str()
+        .ok_or("missing root")?
+        .to_string();
+    render_consensus(lcd, init_slot, &init_root, genesis_time)?;
+    info!("initial render: slot #{}", group_underscore(init_slot));
+    let mut last_render = Instant::now();
+
+    // Subscribe to head events via the Beacon Node SSE endpoint.
+    let resp = ureq::get(&format!("{CL_HTTP_URL}/eth/v1/events?topics=head")).call()?;
+    info!("subscribed to head SSE at {CL_HTTP_URL}");
+
+    let reader = BufReader::new(resp.into_reader());
+    let mut pending: Option<(u64, String)> = None;
+
+    for line_result in reader.lines() {
+        let line = line_result?;
+        if let Some(head) = parse_sse_head(&line)? {
+            info!("received slot #{} from SSE", group_underscore(head.0));
+            pending = Some(head);
+        }
+        // The blank-line separator after each SSE event provides a natural tick
+        // to drain pending; apply the throttle to collapse any rapid-fire events.
+        if pending.is_some() && last_render.elapsed() >= THROTTLE {
+            let (slot, block_root) = pending.take().unwrap();
+            render_consensus(lcd, slot, &block_root, genesis_time)?;
+            last_render = Instant::now();
+            info!("updated lcd to slot #{}", group_underscore(slot));
+        }
+    }
+
+    Err("SSE stream ended".into())
+}
+
 /// Entry point: reads config, initialises the LCD, then delegates to the
 /// appropriate layer loop.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -209,6 +298,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match layer {
         "execution" => run_execution(&mut lcd),
+        "consensus" => run_consensus(&mut lcd),
         other => Err(format!("config.toml: unsupported type {other:?}").into()),
     }
 }
