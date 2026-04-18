@@ -22,7 +22,7 @@ type = "execution"
 Block    #15_623_137
 0x0123456789abcdef01
 2026-04-17 15:23:07Z
-12.34 gwei   42 peers
+12.34 gwei  42 peers
 ```
 
 1. Latest execution-layer block number, thousands grouped with `_`.
@@ -53,10 +53,10 @@ rpcpassword = "s3cr3t"
 ```
 
 ```
-Block     #896_969
+Block       #896_969
 0x000000000000000000
 2026-04-17 15:23:07Z
-12.3 sat/vB  42 peers
+12.3 sat/vB 42 peers
 ```
 
 1. Latest block height, thousands grouped with `_`.
@@ -88,13 +88,18 @@ sudo ./target/release/lcd-odroid
   client) exposing the standard REST API at `127.0.0.1:5052`. The daemon
   performs an initial render on startup, then subscribes to `head` events over
   the SSE endpoint (`/eth/v1/events?topics=head`) and refreshes the display on
-  each new slot (~12 seconds).
+  each new slot (~12 seconds). On stream end or error the daemon exits; run
+  under systemd with `Restart=on-failure` for automatic reconnect.
 - **Bitcoin**: a Bitcoin Core full node with `server=1`, `rpcuser=`, and
   `rpcpassword=` set in `bitcoin.conf`, exposing JSON-RPC at `127.0.0.1:8332`.
   The daemon performs an initial render on startup, then long-polls
   `waitfornewblock` (60-second timeout) and refreshes the display on each new
   block (~10-minute average). See `contrib/bitcoind/` for a reference
-  `bitcoin.conf` and systemd unit.
+  `bitcoin.conf` and systemd unit. Note: the reference config uses
+  `assumevalid=0` to force full script verification from genesis — initial block
+  download will take several days.
+- **Security**: `config.toml` contains the Bitcoin RPC password in plaintext;
+  `chmod 600 config.toml` after writing it.
 
 ## License
 

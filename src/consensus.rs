@@ -89,6 +89,12 @@ pub fn format_atts_peers(att_count: usize, peers: u64) -> String {
 /// Returns `Ok(None)` for non-`data:` lines (e.g. `event:` or blank separator
 /// lines), so callers can feed every line from a [`std::io::BufRead`] iterator directly.
 ///
+/// **Coupling note**: this function assumes every `data:` line carries a `head`
+/// event because the SSE subscription uses `?topics=head`. If the subscription
+/// is ever extended to include additional topics (e.g. `finalized_checkpoint`),
+/// their payloads will fail here with a missing-field error — add a topic
+/// discriminator before expanding the subscription.
+///
 /// # Errors
 /// Returns an error if the `data:` payload is not valid JSON, or if the
 /// expected `slot` or `block` fields are absent or malformed.

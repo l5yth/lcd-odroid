@@ -66,9 +66,10 @@ pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2
 /// Read-timeout applied to the Beacon Node SSE connection.
 ///
 /// If no bytes arrive within this window the SSE stream is considered dead and
-/// `run_consensus` returns an error. Chosen to be long enough to survive a few
-/// missed slots (each slot is 12 s) while still detecting a hung connection.
-pub const SSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// `run_consensus` returns an error. 60 s matches the Bitcoin `waitfornewblock`
+/// poll budget and comfortably survives a run of missed slots before triggering
+/// a reconnect via the systemd `Restart=on-failure` supervisor.
+pub const SSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 // ── LCD trait ────────────────────────────────────────────────────────────────
 

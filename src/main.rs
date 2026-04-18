@@ -334,6 +334,10 @@ fn render_consensus<B: DataBus>(
 /// line triggers an immediate render — no throttle is needed because Ethereum
 /// slots are 12 seconds apart and burst events do not occur on the consensus
 /// layer the way reorgs can on the execution layer.
+///
+/// Returns an error on stream end or I/O failure. There is no internal reconnect
+/// loop; run the daemon under systemd with `Restart=on-failure` for automatic
+/// recovery.
 fn run_consensus<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::error::Error>> {
     // Genesis time is needed to convert slot numbers to wall-clock timestamps.
     let genesis_time: u64 = cl_get("/eth/v1/config/genesis")?["data"]["genesis_time"]
@@ -356,8 +360,8 @@ fn run_consensus<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::err
     info!("initial render: slot #{}", group_underscore(init_slot));
 
     // Subscribe to head events via the Beacon Node SSE endpoint.
-    // A read timeout is set so that a silent/hung connection is detected rather
-    // than blocking the process indefinitely; the caller's error path handles reconnect.
+    // A read timeout ensures a silent/hung connection is detected promptly;
+    // the daemon exits with an error and relies on systemd to restart it.
     let resp = ureq::AgentBuilder::new()
         .timeout_read(SSE_READ_TIMEOUT)
         .build()
