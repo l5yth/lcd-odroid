@@ -9,7 +9,8 @@ layer (go-ethereum) and the consensus layer (Lighthouse / any standard BN API).
 Create `config.toml` next to the binary and set `type` to the desired layer:
 
 ```toml
-type = "execution"   # or "consensus"
+# "execution" (go-ethereum) or "consensus" (Beacon Node)
+type = "execution"
 ```
 
 ## Display layout

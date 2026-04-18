@@ -19,8 +19,9 @@ use std::time::Instant;
 
 use hd44780_driver::{Cursor, CursorBlink, Display, DisplayMode, HD44780, bus::DataBus};
 use lcd_odroid::{
-    LcdDisplay, READ_TIMEOUT, THROTTLE, block_number, extract_new_head, format_lines,
-    format_lines_consensus, group_underscore, parse_hex_u64, parse_sse_head, write_display,
+    LcdDisplay, READ_TIMEOUT, SSE_READ_TIMEOUT, THROTTLE, block_number, extract_new_head,
+    format_lines, format_lines_consensus, group_underscore, parse_hex_u64, parse_sse_head,
+    write_display,
 };
 use linux_embedded_hal::{Delay, I2cdev};
 use serde_json::{Value, json};
@@ -72,6 +73,11 @@ impl<B: DataBus> LcdDisplay for I2cLcd<B> {
 ///
 /// All LCD rows are exactly 20 characters, so no full clear is needed between
 /// updates — each render overwrites the previous content in place.
+///
+/// # Errors
+/// Returns an error if any JSON-RPC HTTP request fails, a response field is
+/// missing or malformed, [`format_lines`] returns an error, or the LCD write
+/// fails.
 fn render<B: DataBus>(
     lcd: &mut I2cLcd<B>,
     header: &Value,
@@ -189,6 +195,11 @@ fn cl_get(path: &str) -> Result<Value, Box<dyn std::error::Error>> {
 
 /// Fetches attestation count and peer count from the Beacon Node, formats all
 /// four lines, and writes them to the display.
+///
+/// # Errors
+/// Returns an error if either Beacon Node HTTP request fails, the peer-count
+/// field is absent or cannot be parsed as [`u64`], [`format_lines_consensus`]
+/// returns an error, or the LCD write fails.
 fn render_consensus<B: DataBus>(
     lcd: &mut I2cLcd<B>,
     slot: u64,
@@ -238,7 +249,13 @@ fn run_consensus<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::err
     info!("initial render: slot #{}", group_underscore(init_slot));
 
     // Subscribe to head events via the Beacon Node SSE endpoint.
-    let resp = ureq::get(&format!("{CL_HTTP_URL}/eth/v1/events?topics=head")).call()?;
+    // A read timeout is set so that a silent/hung connection is detected rather
+    // than blocking the process indefinitely; the caller's error path handles reconnect.
+    let resp = ureq::AgentBuilder::new()
+        .timeout_read(SSE_READ_TIMEOUT)
+        .build()
+        .get(&format!("{CL_HTTP_URL}/eth/v1/events?topics=head"))
+        .call()?;
     info!("subscribed to head SSE at {CL_HTTP_URL}");
 
     let reader = BufReader::new(resp.into_reader());

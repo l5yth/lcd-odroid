@@ -53,6 +53,13 @@ pub const SECONDS_PER_SLOT: u64 = 12;
 /// the throttle without a dedicated timer thread.
 pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Read-timeout applied to the Beacon Node SSE connection.
+///
+/// If no bytes arrive within this window the SSE stream is considered dead and
+/// `run_consensus` returns an error. Chosen to be long enough to survive a few
+/// missed slots (each slot is 12 s) while still detecting a hung connection.
+pub const SSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ── LCD trait ────────────────────────────────────────────────────────────────
 
 /// Hardware-agnostic interface for a 20×4 character-cell LCD panel.
@@ -613,7 +620,9 @@ mod tests {
 
     #[test]
     fn format_lines_consensus_out_of_range_timestamp() {
-        // genesis + slot * 12 > NaiveDateTime::MAX (~year 262143) → DateTime returns None
+        // slot=700B, slot*12=8.4T and genesis+slot*12≈8.4T both fit in u64 and i64,
+        // but the resulting timestamp (~year 266_000) exceeds NaiveDateTime::MAX
+        // (~year 262_143) so DateTime::from_timestamp returns None → "bad timestamp".
         let (_, root, genesis) = sample_consensus_head();
         assert!(format_lines_consensus(700_000_000_000, root, genesis, 0, 0).is_err());
     }
