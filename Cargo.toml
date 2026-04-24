@@ -14,4 +14,4 @@ base64 = { version = "0.22", default-features = false }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
-toml = "0.8"
+toml = "1.1"
