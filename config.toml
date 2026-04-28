@@ -1,4 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 l5y
 
-type = "execution"
+# ── Mode examples ───────────────────────────────────────────────────────────
+# Uncomment exactly one block below (and comment out the active config above)
+# to switch the daemon to a different mode.
+#
+# # Hardware self-test: writes hostname and local IPv4 to the LCD and idles.
+# # Useful for confirming the I²C wiring and panel without any node running.
+type = "hostname"
+#
+# # Execution layer: requires a local go-ethereum node at
+# # 127.0.0.1:8545 (HTTP) and 127.0.0.1:8546 (WebSocket).
+# type = "execution"
+#
+# # Consensus layer: `cl_url` is optional and defaults to
+# # http://127.0.0.1:5052 (Lighthouse default port).
+# type = "consensus"
+# cl_url = "http://127.0.0.1:5052"
+#
+# # Bitcoin: requires Bitcoin Core at 127.0.0.1:8332 with RPC auth enabled.
+# type = "bitcoin"
+# rpcuser = "your-rpc-user"
+# rpcpassword = "your-rpc-password"

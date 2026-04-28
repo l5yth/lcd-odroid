@@ -14,7 +14,7 @@
 
 use std::fs;
 use std::io::{self, BufRead, BufReader};
-use std::net::TcpStream;
+use std::net::{IpAddr, Ipv4Addr, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -38,8 +38,12 @@ const CONFIG_PATH: &str = "config.toml";
 const HTTP_URL: &str = "http://127.0.0.1:8545";
 /// WebSocket endpoint used for `eth_subscribe` / `newHeads`.
 const WS_URL: &str = "ws://127.0.0.1:8546";
-/// Beacon Node REST API endpoint (Lighthouse default port).
-const CL_HTTP_URL: &str = "http://127.0.0.1:5052";
+/// Default Beacon Node REST API endpoint, used when `config.toml` does not set
+/// `cl_url`. Matches the Lighthouse default port.
+const CL_HTTP_URL_DEFAULT: &str = "http://127.0.0.1:5052";
+/// Per-request timeout for non-streaming Beacon Node REST calls. Keeps a
+/// misrouted or unresponsive endpoint from hanging the daemon silently.
+const CL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bitcoin Core JSON-RPC HTTP endpoint.
 const BTC_HTTP_URL: &str = "http://127.0.0.1:8332";
 
@@ -227,15 +231,22 @@ fn set_read_timeout(
     Ok(())
 }
 
-/// Sends a GET request to the Beacon Node REST API and returns the parsed JSON.
+/// Sends a GET request to the Beacon Node REST API rooted at `cl_url` and
+/// returns the parsed JSON.
 ///
 /// # Errors
 /// Returns an error if the HTTP request fails or the response is not valid JSON.
-fn cl_get(path: &str) -> Result<Value, Box<dyn std::error::Error>> {
-    Ok(ureq::get(&format!("{CL_HTTP_URL}{path}"))
-        .call()?
-        .body_mut()
-        .read_json()?)
+fn cl_get(cl_url: &str, path: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    let url = format!("{cl_url}{path}");
+    info!("GET {url}");
+    // Bound the request so a misrouted endpoint or unresponsive server fails
+    // loudly instead of hanging the daemon forever.
+    let agent: Agent = Agent::config_builder()
+        .timeout_recv_response(Some(CL_REQUEST_TIMEOUT))
+        .timeout_recv_body(Some(CL_REQUEST_TIMEOUT))
+        .build()
+        .into();
+    Ok(agent.get(&url).call()?.body_mut().read_json()?)
 }
 
 /// Sends a JSON-RPC 1.0 request to the Bitcoin Core node and returns the `result` field.
@@ -352,17 +363,18 @@ fn run_bitcoin<B: DataBus>(
 /// returns an error, or the LCD write fails.
 fn render_consensus<B: DataBus>(
     lcd: &mut I2cLcd<B>,
+    cl_url: &str,
     slot: u64,
     block_root: &str,
     genesis_time: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Count attestations from the block body.
-    let block = cl_get(&format!("/eth/v2/beacon/blocks/{block_root}"))?;
+    let block = cl_get(cl_url, &format!("/eth/v2/beacon/blocks/{block_root}"))?;
     let att_count = block["data"]["message"]["body"]["attestations"]
         .as_array()
         .map_or(0, |a| a.len());
     // Peer count is a decimal string (unlike EL hex quantities).
-    let peers: u64 = cl_get("/eth/v1/node/peer_count")?["data"]["connected"]
+    let peers: u64 = cl_get(cl_url, "/eth/v1/node/peer_count")?["data"]["connected"]
         .as_str()
         .ok_or("missing peer count")?
         .parse()?;
@@ -381,16 +393,19 @@ fn render_consensus<B: DataBus>(
 /// Returns an error on stream end or I/O failure. There is no internal reconnect
 /// loop; run the daemon under systemd with `Restart=on-failure` for automatic
 /// recovery.
-fn run_consensus<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_consensus<B: DataBus>(
+    lcd: &mut I2cLcd<B>,
+    cl_url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Genesis time is needed to convert slot numbers to wall-clock timestamps.
-    let genesis_time: u64 = cl_get("/eth/v1/config/genesis")?["data"]["genesis_time"]
+    let genesis_time: u64 = cl_get(cl_url, "/eth/v1/beacon/genesis")?["data"]["genesis_time"]
         .as_str()
         .ok_or("missing genesis_time")?
         .parse()?;
     info!("genesis_time={genesis_time}");
 
     // Initial render from the current chain head.
-    let head = cl_get("/eth/v1/beacon/headers/head")?;
+    let head = cl_get(cl_url, "/eth/v1/beacon/headers/head")?;
     let init_slot: u64 = head["data"]["header"]["message"]["slot"]
         .as_str()
         .ok_or("missing slot")?
@@ -399,7 +414,7 @@ fn run_consensus<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::err
         .as_str()
         .ok_or("missing root")?
         .to_string();
-    render_consensus(lcd, init_slot, &init_root, genesis_time)?;
+    render_consensus(lcd, cl_url, init_slot, &init_root, genesis_time)?;
     info!("initial render: slot #{}", group_underscore(init_slot));
 
     // Subscribe to head events via the Beacon Node SSE endpoint.
@@ -411,21 +426,67 @@ fn run_consensus<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::err
         .build()
         .into();
     let resp = agent
-        .get(&format!("{CL_HTTP_URL}/eth/v1/events?topics=head"))
+        .get(&format!("{cl_url}/eth/v1/events?topics=head"))
         .call()?;
-    info!("subscribed to head SSE at {CL_HTTP_URL}");
+    info!("subscribed to head SSE at {cl_url}");
 
     let reader = BufReader::new(resp.into_body().into_reader());
     for line_result in reader.lines() {
         let line = line_result?;
         if let Some((slot, block_root)) = parse_sse_head(&line)? {
             info!("received slot #{} from SSE", group_underscore(slot));
-            render_consensus(lcd, slot, &block_root, genesis_time)?;
+            render_consensus(lcd, cl_url, slot, &block_root, genesis_time)?;
             info!("updated lcd to slot #{}", group_underscore(slot));
         }
     }
 
     Err("SSE stream ended".into())
+}
+
+/// Best-effort lookup of the host's primary IPv4 address.
+///
+/// Uses the canonical "connect a UDP socket to a routable destination and read
+/// its source address" trick. No packets are sent — `connect` just asks the
+/// kernel which interface a packet to that destination would leave from.
+/// Returns an error on hosts with no IPv4 default route or where the resolved
+/// source is not IPv4.
+fn local_ipv4() -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("1.1.1.1:80")?;
+    match socket.local_addr()?.ip() {
+        IpAddr::V4(v4) => Ok(v4),
+        IpAddr::V6(_) => Err("local addr is not IPv4".into()),
+    }
+}
+
+/// Renders host identification (hostname + IPv4) to the LCD and idles, as a
+/// hardware self-test.
+///
+/// Reads the system hostname from `/etc/hostname` and the host's primary IPv4
+/// address via [`local_ipv4`], writes a four-line diagnostic frame, and then
+/// sleeps so the content stays on the panel. Used to confirm the LCD pipeline
+/// (I²C, driver, write_display) works in isolation from any node-RPC plumbing.
+fn run_hostname<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::error::Error>> {
+    let hostname = fs::read_to_string("/etc/hostname")?.trim().to_string();
+    let ip = match local_ipv4() {
+        Ok(v4) => v4.to_string(),
+        Err(e) => {
+            info!("local_ipv4 failed: {e}");
+            "n/a".into()
+        }
+    };
+    info!("hostname={hostname} ip={ip}");
+    let lines = [
+        format!("{:<20.20}", "lcd-odroid self-test"),
+        format!("{:<20.20}", format!("host: {hostname}")),
+        format!("{:<20.20}", format!("ip:   {ip}")),
+        format!("{:<20.20}", ""),
+    ];
+    write_display(lcd, &lines)?;
+    info!("rendered hostname to LCD; idling");
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
 }
 
 /// Entry point: reads config, initialises the LCD, then delegates to the
@@ -461,8 +522,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match layer {
+        "hostname" => run_hostname(&mut lcd),
         "execution" => run_execution(&mut lcd),
-        "consensus" => run_consensus(&mut lcd),
+        "consensus" => {
+            let cl_url = cfg
+                .get("cl_url")
+                .map(|v| {
+                    v.as_str()
+                        .ok_or("config.toml: 'cl_url' must be a string")
+                        .map(str::to_string)
+                })
+                .transpose()?
+                .unwrap_or_else(|| CL_HTTP_URL_DEFAULT.to_string());
+            run_consensus(&mut lcd, &cl_url)
+        }
         "bitcoin" => {
             let user = cfg
                 .get("rpcuser")
