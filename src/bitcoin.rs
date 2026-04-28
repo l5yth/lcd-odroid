@@ -16,9 +16,7 @@
 //!
 //! All functions operate on plain Rust values; no hardware or network I/O.
 
-use chrono::DateTime;
-
-use super::group_underscore;
+use super::{format_hex_line, format_label_number, format_status_line, format_timestamp_line};
 
 // ── Bitcoin display ──────────────────────────────────────────────────────────
 
@@ -32,7 +30,7 @@ use super::group_underscore;
 /// | 4   | Fee rate in sat/vByte and peer count, padded to 20 chars |
 ///
 /// # Errors
-/// Returns an error if `timestamp` is outside the valid [`DateTime`] range.
+/// Returns an error if [`format_timestamp_line`] rejects `timestamp`.
 pub fn format_lines_bitcoin(
     height: u64,
     hash: &str,
@@ -40,26 +38,12 @@ pub fn format_lines_bitcoin(
     fee_sat_vb: f64,
     peers: u64,
 ) -> Result<[String; 4], Box<dyn std::error::Error>> {
-    // Label left-justified in 5 chars; height right-justified in the remaining 15.
-    let line1 = format!(
-        "{:<5}{:>15}",
-        "Block",
-        format!("#{}", group_underscore(height))
-    );
-    // "0x" prefix (2 chars) + first 18 hex chars of the hash = 20 chars total.
-    // Space-padded in case the hash is unusually short so the 20-char invariant holds.
-    // Note: Bitcoin hashes have many leading zeros that visually reflect PoW difficulty.
-    let line2 = format!(
-        "{:<20}",
-        format!("0x{}", hash.chars().take(18).collect::<String>())
-    );
-    // Bitcoin block `time` is a Unix u32 (max ~year 2106, always fits in i64),
-    // but use checked conversion for consistency with the consensus module.
-    let ts_i64 = i64::try_from(timestamp).map_err(|_| "timestamp out of i64 range")?;
-    let line3 = DateTime::from_timestamp(ts_i64, 0)
-        .ok_or("bad timestamp")?
-        .format("%Y-%m-%d %H:%M:%SZ")
-        .to_string();
+    let line1 = format_label_number("Block", height);
+    // Bitcoin hashes are bare hex; prepend "0x" then take 18 chars so the
+    // helper sees an already-prefixed 20-char string. The leading-zero pattern
+    // visually reflects PoW difficulty.
+    let line2 = format_hex_line(&format!("0x{}", hash.chars().take(18).collect::<String>()));
+    let line3 = format_timestamp_line(timestamp)?;
     let line4 = format_fee_peers(fee_sat_vb, peers);
 
     Ok([line1, line2, line3, line4])
@@ -85,7 +69,7 @@ pub fn format_fee_peers(fee_sat_vb: f64, peers: u64) -> String {
         format!("{:.1} sat/vB", fee_sat_vb)
     };
     let peer_str = format!("{} peers", peers);
-    format!("{:<11}{:>9}", fee_str, peer_str)
+    format_status_line(&fee_str, &peer_str)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
