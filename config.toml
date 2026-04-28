@@ -1,4 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 l5y
 
-type = "execution"
+type = "hostname"
+
+# ── Hardware (optional, all modes) ──────────────────────────────────────────
+# Defaults shown; override only if your wiring differs.
+# i2c_bus  = "/dev/i2c-0"
+# i2c_addr = 0x27
+
+# ── Mode examples ───────────────────────────────────────────────────────────
+# Uncomment exactly one block below (and comment out the active config above)
+# to switch the daemon to a different mode. Endpoint keys are all optional;
+# the defaults shown match the address each upstream tool listens on by default.
+#
+# # Hardware self-test: writes hostname and local IPv4 to the LCD and idles.
+# # Useful for confirming the I²C wiring and panel without any node running.
+# type = "hostname"
+#
+# # Execution layer: requires a go-ethereum node reachable at the URLs below.
+# type = "execution"
+# el_http_url = "http://127.0.0.1:8545"
+# el_ws_url   = "ws://127.0.0.1:8546"
+#
+# # Consensus layer: requires a Beacon Node REST API (Lighthouse default port).
+# type = "consensus"
+# cl_url = "http://127.0.0.1:5052"
+#
+# # Bitcoin: requires Bitcoin Core with RPC auth enabled.
+# type = "bitcoin"
+# btc_url     = "http://127.0.0.1:8332"
+# rpcuser     = "your-rpc-user"
+# rpcpassword = "your-rpc-password"

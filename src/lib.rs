@@ -29,7 +29,26 @@ pub use bitcoin::*;
 pub use consensus::*;
 pub use execution::*;
 
+use chrono::DateTime;
 use serde_json::Value;
+
+// ── Logging ──────────────────────────────────────────────────────────────────
+
+/// Logs a timestamped INFO line to stderr.
+///
+/// Defined here (and `#[macro_export]`-ed) so every binary submodule in the
+/// crate shares one logger without each having to redefine it. The macro
+/// uses absolute paths so callers do not need to import `chrono` to use it.
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) => {{
+        eprintln!(
+            "[{}] INFO  {}",
+            ::chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            ::std::format_args!($($arg)*)
+        );
+    }};
+}
 
 // ── HD44780 row addresses ────────────────────────────────────────────────────
 
@@ -150,6 +169,47 @@ pub fn group_underscore(n: u64) -> String {
         out.push(b as char);
     }
     out
+}
+
+/// Formats the 20-char "label + number" line used by every layer's first LCD row.
+///
+/// Layout: `label` left-justified in 5 columns, `#`-prefixed number with
+/// underscore thousands separators right-justified in the remaining 15.
+/// Example: `format_label_number("Block", 21_000_000)` → `"Block    #21_000_000"`.
+pub fn format_label_number(label: &str, n: u64) -> String {
+    format!("{:<5}{:>15}", label, format!("#{}", group_underscore(n)))
+}
+
+/// Formats a hex string into the 20-char hash/root LCD row.
+///
+/// Takes the first 20 characters of `hex` and pads with spaces if shorter.
+/// Used by layers whose hash strings already include the `0x` prefix
+/// (execution and consensus); Bitcoin builds the prefix manually before calling.
+pub fn format_hex_line(hex: &str) -> String {
+    format!("{:<20}", hex.chars().take(20).collect::<String>())
+}
+
+/// Formats a Unix timestamp (seconds) as the 20-char `YYYY-MM-DD HH:MM:SSZ`
+/// line used by every layer's third LCD row.
+///
+/// # Errors
+/// Returns an error if `timestamp` overflows [`i64`] or is outside chrono's
+/// representable [`DateTime`] range (~ year 262_143).
+pub fn format_timestamp_line(timestamp: u64) -> Result<String, Box<dyn std::error::Error>> {
+    let ts_i64 = i64::try_from(timestamp).map_err(|_| "timestamp out of i64 range")?;
+    Ok(DateTime::from_timestamp(ts_i64, 0)
+        .ok_or("bad timestamp")?
+        .format("%Y-%m-%d %H:%M:%SZ")
+        .to_string())
+}
+
+/// Formats two preformatted strings into the 20-char status line used by
+/// every layer's fourth LCD row: 11-char left column, 9-char right column.
+///
+/// Callers must shape `left` and `right` to fit their respective columns —
+/// this helper only handles the layout.
+pub fn format_status_line(left: &str, right: &str) -> String {
+    format!("{:<11}{:>9}", left, right)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -296,5 +356,76 @@ mod tests {
             "d".to_string(),
         ];
         assert!(write_display(&mut FailLcd, &lines).is_err());
+    }
+
+    // ── format_label_number ──────────────────────────────────────────────────
+
+    #[test]
+    fn format_label_number_block_typical() {
+        let s = format_label_number("Block", 21_000_000);
+        assert_eq!(s, "Block    #21_000_000");
+        assert_eq!(s.len(), 20);
+    }
+
+    #[test]
+    fn format_label_number_zero() {
+        let s = format_label_number("Slot", 0);
+        assert_eq!(s.len(), 20);
+        assert!(s.starts_with("Slot "));
+        assert!(s.ends_with("#0"));
+    }
+
+    // ── format_hex_line ──────────────────────────────────────────────────────
+
+    #[test]
+    fn format_hex_line_long_input_truncated() {
+        let s = format_hex_line("0xabcdef1234567890abcdef1234567890");
+        assert_eq!(s, "0xabcdef1234567890ab");
+        assert_eq!(s.len(), 20);
+    }
+
+    #[test]
+    fn format_hex_line_short_input_padded() {
+        let s = format_hex_line("0xabc");
+        assert_eq!(s, "0xabc               ");
+        assert_eq!(s.len(), 20);
+    }
+
+    // ── format_timestamp_line ────────────────────────────────────────────────
+
+    #[test]
+    fn format_timestamp_line_typical() {
+        let s = format_timestamp_line(1_700_000_000).unwrap();
+        assert_eq!(s.len(), 20);
+        assert!(s.ends_with('Z'));
+    }
+
+    #[test]
+    fn format_timestamp_line_i64_overflow() {
+        // u64::MAX > i64::MAX → try_from fails
+        assert!(format_timestamp_line(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn format_timestamp_line_chrono_out_of_range() {
+        // Fits i64 but exceeds NaiveDateTime::MAX (~ year 262_143).
+        assert!(format_timestamp_line(u64::MAX / 2).is_err());
+    }
+
+    // ── format_status_line ───────────────────────────────────────────────────
+
+    #[test]
+    fn format_status_line_layout() {
+        let s = format_status_line("12.3 sat/vB", "42 peers");
+        assert_eq!(s, "12.3 sat/vB 42 peers");
+        assert_eq!(s.len(), 20);
+    }
+
+    #[test]
+    fn format_status_line_short_left_pads_with_spaces() {
+        let s = format_status_line("hi", "bye");
+        assert_eq!(s.len(), 20);
+        assert!(s.starts_with("hi "));
+        assert!(s.ends_with(" bye"));
     }
 }

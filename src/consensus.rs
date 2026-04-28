@@ -16,10 +16,12 @@
 //!
 //! All functions operate on plain Rust values; no hardware or network I/O.
 
-use chrono::DateTime;
 use serde_json::Value;
 
-use super::{SECONDS_PER_SLOT, group_underscore};
+use super::{
+    SECONDS_PER_SLOT, format_hex_line, format_label_number, format_status_line,
+    format_timestamp_line,
+};
 
 // ── Consensus-layer display ──────────────────────────────────────────────────
 
@@ -33,9 +35,8 @@ use super::{SECONDS_PER_SLOT, group_underscore};
 /// | 4   | Attestation count and peer count, padded to 20 chars |
 ///
 /// # Errors
-/// Returns an error if the slot-to-timestamp arithmetic overflows, if the
-/// timestamp value cannot be represented as [`i64`], or if the timestamp is
-/// outside the valid [`DateTime`] range.
+/// Returns an error if the slot-to-timestamp arithmetic overflows or if
+/// [`format_timestamp_line`] rejects the resulting timestamp.
 pub fn format_lines_consensus(
     slot: u64,
     block_root: &str,
@@ -50,22 +51,10 @@ pub fn format_lines_consensus(
     let timestamp = genesis_time
         .checked_add(slot_secs)
         .ok_or("timestamp overflow")?;
-    let ts_i64 = i64::try_from(timestamp).map_err(|_| "timestamp out of i64 range")?;
 
-    // Label left-justified in 5 chars; slot number right-justified in 15.
-    let line1 = format!(
-        "{:<5}{:>15}",
-        "Slot",
-        format!("#{}", group_underscore(slot))
-    );
-    // First 20 hex characters of the block root (the "0x" prefix is included).
-    // Space-padded to maintain the 20-char invariant if the root is unusually short.
-    let line2 = format!("{:<20}", block_root.chars().take(20).collect::<String>());
-    // UTC wall-clock time — always exactly 20 characters.
-    let line3 = DateTime::from_timestamp(ts_i64, 0)
-        .ok_or("bad timestamp")?
-        .format("%Y-%m-%d %H:%M:%SZ")
-        .to_string();
+    let line1 = format_label_number("Slot", slot);
+    let line2 = format_hex_line(block_root);
+    let line3 = format_timestamp_line(timestamp)?;
     let line4 = format_atts_peers(att_count, peers);
 
     Ok([line1, line2, line3, line4])
@@ -78,7 +67,7 @@ pub fn format_lines_consensus(
 pub fn format_atts_peers(att_count: usize, peers: u64) -> String {
     let att_str = format!("{} atts", att_count);
     let peer_str = format!("{} peers", peers);
-    format!("{:<11}{:>9}", att_str, peer_str)
+    format_status_line(&att_str, &peer_str)
 }
 
 // ── SSE message parsing ──────────────────────────────────────────────────────

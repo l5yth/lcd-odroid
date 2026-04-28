@@ -16,10 +16,11 @@
 //!
 //! All functions operate on plain Rust values; no hardware or network I/O.
 
-use chrono::DateTime;
 use serde_json::Value;
 
-use super::{group_underscore, parse_hex_u64};
+use super::{
+    format_hex_line, format_label_number, format_status_line, format_timestamp_line, parse_hex_u64,
+};
 
 // ── Execution-layer display ──────────────────────────────────────────────────
 
@@ -34,8 +35,8 @@ use super::{group_underscore, parse_hex_u64};
 ///
 /// # Errors
 /// Returns an error if `header` is missing the `number`, `hash`, or `timestamp`
-/// field, if any field cannot be hex-decoded, or if the timestamp is outside
-/// the valid [`DateTime`] range.
+/// field, if any field cannot be hex-decoded, or if [`format_timestamp_line`]
+/// rejects the block timestamp.
 pub fn format_lines(
     header: &Value,
     gas_wei: u64,
@@ -45,21 +46,9 @@ pub fn format_lines(
     let hash = header["hash"].as_str().ok_or("hash")?;
     let timestamp = parse_hex_u64(header["timestamp"].as_str().ok_or("timestamp")?)?;
 
-    // Label left-justified in 5 chars; number right-justified in the remaining 15.
-    let line1 = format!(
-        "{:<5}{:>15}",
-        "Block",
-        format!("#{}", group_underscore(number))
-    );
-    // First 20 hex characters of the block hash (the "0x" prefix is included in the count).
-    // Padded with spaces if the hash is somehow shorter than 20 chars so the LCD line
-    // length invariant is maintained and stale characters are not left on the display.
-    let line2 = format!("{:<20}", hash.chars().take(20).collect::<String>());
-    // UTC wall-clock time — "%Y-%m-%d %H:%M:%SZ" is always exactly 20 characters.
-    let line3 = DateTime::from_timestamp(timestamp as i64, 0)
-        .ok_or("bad timestamp")?
-        .format("%Y-%m-%d %H:%M:%SZ")
-        .to_string();
+    let line1 = format_label_number("Block", number);
+    let line2 = format_hex_line(hash);
+    let line3 = format_timestamp_line(timestamp)?;
     let line4 = format_gas_peers(gas_wei, peers);
 
     Ok([line1, line2, line3, line4])
@@ -79,7 +68,7 @@ pub fn format_gas_peers(gas_wei: u64, peers: u64) -> String {
         format!("{:.2} gwei", gwei)
     };
     let peer_str = format!("{} peers", peers);
-    format!("{:<11}{:>9}", gas_str, peer_str)
+    format_status_line(&gas_str, &peer_str)
 }
 
 // ── WebSocket message parsing ────────────────────────────────────────────────
