@@ -15,18 +15,22 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::net::TcpStream;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use embedded_hal::blocking::delay::{DelayMs, DelayUs};
+use embedded_hal::blocking::i2c::Write as I2cWrite02;
+use embedded_hal_1::i2c::I2c as _;
 use hd44780_driver::{Cursor, CursorBlink, Display, DisplayMode, HD44780, bus::DataBus};
 use lcd_odroid::{
     LcdDisplay, READ_TIMEOUT, SSE_READ_TIMEOUT, THROTTLE, block_number, extract_new_head,
     format_lines, format_lines_bitcoin, format_lines_consensus, group_underscore, parse_hex_u64,
     parse_sse_head, write_display,
 };
-use linux_embedded_hal::{Delay, I2cdev};
+use linux_embedded_hal::{I2CError, I2cdev};
 use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
+use ureq::Agent;
 
 /// Path to the TOML configuration file, relative to the working directory.
 const CONFIG_PATH: &str = "config.toml";
@@ -50,13 +54,47 @@ macro_rules! info {
     }};
 }
 
-/// Concrete LCD implementation that wraps [`HD44780`] and a [`Delay`] provider.
+/// Adapter that wraps [`linux_embedded_hal::I2cdev`] and re-exposes it through
+/// the embedded-hal 0.2 [`I2cWrite02`] trait that `hd44780-driver` 0.4 requires.
+///
+/// `linux-embedded-hal` 0.4 dropped its embedded-hal 0.2 impls when it migrated
+/// to 1.0; this shim forwards each 0.2 `write` call to the underlying 1.0 `I2c`
+/// implementation so the existing driver keeps working unchanged.
+struct I2cAdapter(I2cdev);
+
+impl I2cWrite02 for I2cAdapter {
+    type Error = I2CError;
+
+    fn write(&mut self, address: u8, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.0.write(address, bytes)
+    }
+}
+
+/// Adapter that re-exposes [`linux_embedded_hal::Delay`] through the
+/// embedded-hal 0.2 [`DelayUs`]/[`DelayMs`] traits that `hd44780-driver` 0.4
+/// requires. The driver only ever asks for `u16` µs and `u8` ms delays, so
+/// only those two width specialisations are implemented.
+struct DelayAdapter;
+
+impl DelayUs<u16> for DelayAdapter {
+    fn delay_us(&mut self, us: u16) {
+        std::thread::sleep(Duration::from_micros(u64::from(us)));
+    }
+}
+
+impl DelayMs<u8> for DelayAdapter {
+    fn delay_ms(&mut self, ms: u8) {
+        std::thread::sleep(Duration::from_millis(u64::from(ms)));
+    }
+}
+
+/// Concrete LCD implementation that wraps [`HD44780`] and a [`DelayAdapter`].
 ///
 /// Owns both so callers can use a single `&mut I2cLcd<B>` rather than threading
 /// two separate mutable references through every call.
 struct I2cLcd<B: DataBus> {
     lcd: HD44780<B>,
-    delay: Delay,
+    delay: DelayAdapter,
 }
 
 impl<B: DataBus> LcdDisplay for I2cLcd<B> {
@@ -113,7 +151,7 @@ fn run_execution<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::err
 
     let (mut ws, _) = tungstenite::connect(WS_URL)?;
     set_read_timeout(&mut ws, READ_TIMEOUT)?;
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}).to_string(),
     ))?;
     info!("subscribed to newHeads at {}", WS_URL);
@@ -165,7 +203,10 @@ fn run_execution<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::err
 /// or the response contains a JSON-RPC `error` object.
 fn rpc_http(method: &str, params: Value) -> Result<Value, Box<dyn std::error::Error>> {
     let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-    let resp: Value = ureq::post(HTTP_URL).send_json(body)?.into_json()?;
+    let resp: Value = ureq::post(HTTP_URL)
+        .send_json(body)?
+        .body_mut()
+        .read_json()?;
     if let Some(err) = resp.get("error") {
         return Err(format!("rpc {method}: {err}").into());
     }
@@ -193,7 +234,8 @@ fn set_read_timeout(
 fn cl_get(path: &str) -> Result<Value, Box<dyn std::error::Error>> {
     Ok(ureq::get(&format!("{CL_HTTP_URL}{path}"))
         .call()?
-        .into_json()?)
+        .body_mut()
+        .read_json()?)
 }
 
 /// Sends a JSON-RPC 1.0 request to the Bitcoin Core node and returns the `result` field.
@@ -216,9 +258,10 @@ fn rpc_btc(
     );
     let body = json!({ "jsonrpc": "1.0", "id": 1, "method": method, "params": params });
     let resp: Value = ureq::post(BTC_HTTP_URL)
-        .set("Authorization", &auth)
+        .header("Authorization", &auth)
         .send_json(body)?
-        .into_json()?;
+        .body_mut()
+        .read_json()?;
     if !resp["error"].is_null() {
         return Err(format!("rpc {method}: {}", resp["error"]).into());
     }
@@ -360,16 +403,19 @@ fn run_consensus<B: DataBus>(lcd: &mut I2cLcd<B>) -> Result<(), Box<dyn std::err
     info!("initial render: slot #{}", group_underscore(init_slot));
 
     // Subscribe to head events via the Beacon Node SSE endpoint.
-    // A read timeout ensures a silent/hung connection is detected promptly;
-    // the daemon exits with an error and relies on systemd to restart it.
-    let resp = ureq::AgentBuilder::new()
-        .timeout_read(SSE_READ_TIMEOUT)
+    // `timeout_recv_body` (the ureq 3 successor of `timeout_read`) ensures a
+    // silent/hung connection is detected promptly; the daemon exits with an
+    // error and relies on systemd to restart it.
+    let agent: Agent = Agent::config_builder()
+        .timeout_recv_body(Some(SSE_READ_TIMEOUT))
         .build()
+        .into();
+    let resp = agent
         .get(&format!("{CL_HTTP_URL}/eth/v1/events?topics=head"))
         .call()?;
     info!("subscribed to head SSE at {CL_HTTP_URL}");
 
-    let reader = BufReader::new(resp.into_reader());
+    let reader = BufReader::new(resp.into_body().into_reader());
     for line_result in reader.lines() {
         let line = line_result?;
         if let Some((slot, block_root)) = parse_sse_head(&line)? {
@@ -392,8 +438,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("config.toml: missing or non-string 'type' field")?;
     info!("loaded {} (layer={})", CONFIG_PATH, layer);
 
-    let i2c = I2cdev::new("/dev/i2c-0")?;
-    let mut delay = Delay;
+    let i2c = I2cAdapter(I2cdev::new("/dev/i2c-0")?);
+    let mut delay = DelayAdapter;
     let mut lcd_inner = HD44780::new_i2c(i2c, 0x27, &mut delay).map_err(|_| "lcd init")?;
     lcd_inner.reset(&mut delay).map_err(|_| "reset")?;
     lcd_inner.clear(&mut delay).map_err(|_| "clear")?;

@@ -9,6 +9,11 @@ edition = "2024"
 [dependencies]
 hd44780-driver = "0.4"
 linux-embedded-hal = "0.4"
+# hd44780-driver 0.4 still requires embedded-hal 0.2 traits, while
+# linux-embedded-hal 0.4 only implements embedded-hal 1.0. Both majors are
+# pulled in so a thin adapter in `main.rs` can bridge the two.
+embedded-hal = "0.2"
+embedded-hal-1 = { package = "embedded-hal", version = "1" }
 ureq = { version = "3", default-features = false, features = ["json"] }
 base64 = { version = "0.22", default-features = false }
 serde_json = "1"
