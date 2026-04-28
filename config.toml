@@ -3,6 +3,11 @@
 
 type = "hostname"
 
+# ── Hardware (optional, all modes) ──────────────────────────────────────────
+# Defaults shown; override only if your wiring differs.
+# i2c_bus  = "/dev/i2c-0"
+# i2c_addr = 0x27
+
 # ── Mode examples ───────────────────────────────────────────────────────────
 # Uncomment exactly one block below (and comment out the active config above)
 # to switch the daemon to a different mode. Endpoint keys are all optional;

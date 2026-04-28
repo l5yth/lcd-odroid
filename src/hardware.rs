@@ -26,10 +26,11 @@ use hd44780_driver::{Cursor, CursorBlink, Display, DisplayMode, HD44780, bus::Da
 use lcd_odroid::{LcdDisplay, info};
 use linux_embedded_hal::{I2CError, I2cdev};
 
-/// Linux I²C bus device path used on the ODROID.
-pub const I2C_BUS: &str = "/dev/i2c-0";
-/// HD44780 backpack address on the I²C bus.
-pub const I2C_ADDR: u8 = 0x27;
+/// Default Linux I²C bus device path. Override with `i2c_bus` in `config.toml`.
+pub const I2C_BUS_DEFAULT: &str = "/dev/i2c-0";
+/// Default HD44780 backpack address on the I²C bus. Override with `i2c_addr`
+/// in `config.toml`.
+pub const I2C_ADDR_DEFAULT: u8 = 0x27;
 
 /// Adapter that wraps [`linux_embedded_hal::I2cdev`] and re-exposes it through
 /// the embedded-hal 0.2 [`I2cWrite02`] trait that `hd44780-driver` 0.4 requires.
@@ -86,16 +87,17 @@ impl<B: DataBus> LcdDisplay for I2cLcd<B> {
     }
 }
 
-/// Opens the I²C bus, brings the HD44780 panel up in 4-line mode, and returns
-/// an [`LcdDisplay`] handle ready for the runner to write into.
+/// Opens the given I²C bus, brings the HD44780 panel up at `addr` in 4-line
+/// mode, and returns an [`LcdDisplay`] handle ready for the runner to write
+/// into.
 ///
 /// # Errors
 /// Returns an error if the I²C device cannot be opened, or if any HD44780
 /// initialisation step (reset, clear, display-mode set) fails.
-pub fn init_lcd() -> Result<impl LcdDisplay, Box<dyn std::error::Error>> {
-    let i2c = I2cAdapter(I2cdev::new(I2C_BUS)?);
+pub fn init_lcd(bus: &str, addr: u8) -> Result<impl LcdDisplay, Box<dyn std::error::Error>> {
+    let i2c = I2cAdapter(I2cdev::new(bus)?);
     let mut delay = DelayAdapter;
-    let mut lcd_inner = HD44780::new_i2c(i2c, I2C_ADDR, &mut delay).map_err(|_| "lcd init")?;
+    let mut lcd_inner = HD44780::new_i2c(i2c, addr, &mut delay).map_err(|_| "lcd init")?;
     lcd_inner.reset(&mut delay).map_err(|_| "reset")?;
     lcd_inner.clear(&mut delay).map_err(|_| "clear")?;
     lcd_inner
@@ -108,7 +110,7 @@ pub fn init_lcd() -> Result<impl LcdDisplay, Box<dyn std::error::Error>> {
             &mut delay,
         )
         .map_err(|_| "mode")?;
-    info!("LCD initialized on {} @ 0x{:02X}", I2C_BUS, I2C_ADDR);
+    info!("LCD initialized on {bus} @ 0x{addr:02X}");
     Ok(I2cLcd {
         lcd: lcd_inner,
         delay,

@@ -51,6 +51,20 @@ fn cfg_required(cfg: &toml::Value, key: &str) -> Result<String, Box<dyn std::err
         .ok_or_else(|| format!("config.toml: missing '{key}'").into())
 }
 
+/// Reads an optional integer field, validates it fits in [`u8`], and returns
+/// `default` if the field is absent.
+fn cfg_u8(cfg: &toml::Value, key: &str, default: u8) -> Result<u8, Box<dyn std::error::Error>> {
+    match cfg.get(key) {
+        None => Ok(default),
+        Some(v) => {
+            let n = v
+                .as_integer()
+                .ok_or_else(|| format!("config.toml: '{key}' must be an integer"))?;
+            u8::try_from(n).map_err(|_| format!("config.toml: '{key}' out of u8 range: {n}").into())
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg: toml::Value = toml::from_str(&fs::read_to_string(CONFIG_PATH)?)?;
     let layer = cfg
@@ -59,7 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("config.toml: missing or non-string 'type' field")?;
     info!("loaded {} (layer={})", CONFIG_PATH, layer);
 
-    let mut lcd = hardware::init_lcd()?;
+    let i2c_bus = cfg_str(&cfg, "i2c_bus", hardware::I2C_BUS_DEFAULT)?;
+    let i2c_addr = cfg_u8(&cfg, "i2c_addr", hardware::I2C_ADDR_DEFAULT)?;
+    let mut lcd = hardware::init_lcd(&i2c_bus, i2c_addr)?;
 
     match layer {
         "hostname" => runner::hostname::run(&mut lcd),
