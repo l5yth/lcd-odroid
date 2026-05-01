@@ -496,7 +496,6 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "chrono",
- "embedded-hal 0.2.7",
  "embedded-hal 1.0.0",
  "hd44780-driver",
  "linux-embedded-hal",
