@@ -21,10 +21,10 @@ use std::time::Duration;
 
 use embedded_hal::blocking::delay::{DelayMs, DelayUs};
 use embedded_hal::blocking::i2c::Write as I2cWrite02;
-use embedded_hal_1::i2c::I2c as _;
 use hd44780_driver::{Cursor, CursorBlink, Display, DisplayMode, HD44780, bus::DataBus};
+use i2cdev::core::I2CDevice;
+use i2cdev::linux::{LinuxI2CDevice, LinuxI2CError};
 use lcd_odroid::{LcdDisplay, info};
-use linux_embedded_hal::{I2CError, I2cdev};
 
 /// Default Linux I²C bus device path. Override with `i2c_bus` in `config.toml`.
 pub const I2C_BUS_DEFAULT: &str = "/dev/i2c-0";
@@ -32,26 +32,25 @@ pub const I2C_BUS_DEFAULT: &str = "/dev/i2c-0";
 /// in `config.toml`.
 pub const I2C_ADDR_DEFAULT: u8 = 0x27;
 
-/// Adapter that wraps [`linux_embedded_hal::I2cdev`] and re-exposes it through
-/// the embedded-hal 0.2 [`I2cWrite02`] trait that `hd44780-driver` 0.4 requires.
+/// Adapter that wraps a [`LinuxI2CDevice`] and exposes it through the
+/// embedded-hal 0.2 [`I2cWrite02`] trait that `hd44780-driver` 0.4 requires.
 ///
-/// `linux-embedded-hal` 0.4 dropped its embedded-hal 0.2 impls when it migrated
-/// to 1.0; this shim forwards each 0.2 `write` call to the underlying 1.0 `I2c`
-/// implementation so the existing driver keeps working unchanged.
-pub struct I2cAdapter(pub I2cdev);
+/// The slave address is fixed when the device is opened, so the `address`
+/// argument passed by the driver on every call is ignored.
+pub struct I2cAdapter(pub LinuxI2CDevice);
 
 impl I2cWrite02 for I2cAdapter {
-    type Error = I2CError;
+    type Error = LinuxI2CError;
 
-    fn write(&mut self, address: u8, bytes: &[u8]) -> Result<(), Self::Error> {
-        self.0.write(address, bytes)
+    fn write(&mut self, _address: u8, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.0.write(bytes)
     }
 }
 
-/// Adapter that re-exposes [`linux_embedded_hal::Delay`] semantics through the
-/// embedded-hal 0.2 [`DelayUs`]/[`DelayMs`] traits that `hd44780-driver` 0.4
-/// requires. The driver only ever asks for `u16` µs and `u8` ms delays, so
-/// only those two width specialisations are implemented.
+/// Sleep-based [`DelayUs`]/[`DelayMs`] implementation for the embedded-hal 0.2
+/// traits that `hd44780-driver` 0.4 requires. The driver only ever asks for
+/// `u16` µs and `u8` ms delays, so only those two width specialisations are
+/// implemented.
 pub struct DelayAdapter;
 
 impl DelayUs<u16> for DelayAdapter {
@@ -95,7 +94,7 @@ impl<B: DataBus> LcdDisplay for I2cLcd<B> {
 /// Returns an error if the I²C device cannot be opened, or if any HD44780
 /// initialisation step (reset, clear, display-mode set) fails.
 pub fn init_lcd(bus: &str, addr: u8) -> Result<impl LcdDisplay, Box<dyn std::error::Error>> {
-    let i2c = I2cAdapter(I2cdev::new(bus)?);
+    let i2c = I2cAdapter(LinuxI2CDevice::new(bus, u16::from(addr))?);
     let mut delay = DelayAdapter;
     let mut lcd_inner = HD44780::new_i2c(i2c, addr, &mut delay).map_err(|_| "lcd init")?;
     lcd_inner.reset(&mut delay).map_err(|_| "reset")?;
