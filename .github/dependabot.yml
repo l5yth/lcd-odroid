@@ -7,6 +7,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: embedded-hal
+        versions: [">=1.0.0"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
