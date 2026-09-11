@@ -20,12 +20,20 @@ use super::{format_hex_line, format_label_number, format_status_line, format_tim
 
 // ── Bitcoin display ──────────────────────────────────────────────────────────
 
+/// Number of trailing hash characters shown on LCD row 2.
+///
+/// The row is 20 columns; the `"0x.."` prefix takes four of them, leaving 16.
+/// The tail is shown rather than the head because a Bitcoin block hash opens
+/// with a proof-of-work zero run — 19 nibbles or more at present — that is
+/// wider than the row and therefore identical on every block.
+const HASH_TAIL_CHARS: usize = 16;
+
 /// Formats the four LCD lines from a Bitcoin block.
 ///
 /// | Row | Content |
 /// |-----|---------|
 /// | 1   | `"Block     #1_623_137"` – block height right-aligned to 20 chars |
-/// | 2   | `"0x"` followed by the first 18 characters of the block hash, space-padded |
+/// | 2   | `"0x.."` followed by the last 16 characters of the block hash |
 /// | 3   | Block timestamp formatted as `YYYY-MM-DD HH:MM:SSZ` (exactly 20 chars) |
 /// | 4   | Fee rate in sat/vByte and peer count, padded to 20 chars |
 ///
@@ -39,10 +47,17 @@ pub fn format_lines_bitcoin(
     peers: u64,
 ) -> Result<[String; 4], Box<dyn std::error::Error>> {
     let line1 = format_label_number("Block", height);
-    // Bitcoin hashes are bare hex; prepend "0x" then take 18 chars so the
-    // helper sees an already-prefixed 20-char string. The leading-zero pattern
-    // visually reflects PoW difficulty.
-    let line2 = format_hex_line(&format!("0x{}", hash.chars().take(18).collect::<String>()));
+    // Bitcoin hashes are bare hex and, at current PoW difficulty, open with a
+    // run of 19 or more zero nibbles — wider than the row itself, so a leading
+    // window renders the same constant string for every block. Take the
+    // low-order tail instead, which is the part that identifies the block, and
+    // mark the elided middle with "..". `chars()` rather than byte slicing so a
+    // malformed non-ASCII hash cannot panic on a char boundary.
+    let skip = hash.chars().count().saturating_sub(HASH_TAIL_CHARS);
+    let tail: String = hash.chars().skip(skip).collect();
+    // "0x" + ".." + 16 = exactly 20, so format_hex_line neither truncates nor
+    // pads a well-formed hash; it only pads a short, malformed one.
+    let line2 = format_hex_line(&format!("0x..{tail}"));
     let line3 = format_timestamp_line(timestamp)?;
     let line4 = format_fee_peers(fee_sat_vb, peers);
 
@@ -131,10 +146,12 @@ mod tests {
     // ── format_lines_bitcoin ─────────────────────────────────────────────────
 
     fn sample_block() -> (u64, &'static str, u64) {
+        // Real mainnet block 800 000: a full 64-character hash with the
+        // 19-nibble leading-zero run that current PoW difficulty produces.
         (
-            896_969,                                                           // height
-            "000000000000000000029e6aa02cd33459c76d32b786eba3eb3e1ea9af4e469", // hash
-            1_745_000_000, // timestamp (approx 2025)
+            800_000,                                                            // height
+            "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054", // hash
+            1_690_168_629,                                                      // timestamp
         )
     }
 
@@ -142,15 +159,55 @@ mod tests {
     fn format_lines_bitcoin_happy_path() {
         let (height, hash, ts) = sample_block();
         let lines = format_lines_bitcoin(height, hash, ts, 12.3, 42).unwrap();
-        assert_eq!(lines[0], "Block       #896_969");
-        // "0x" + first 18 chars of the hash (all zeros for this block)
-        assert_eq!(lines[1], "0x000000000000000000");
+        assert_eq!(lines[0], "Block       #800_000");
+        // "0x.." + the last 16 chars of the hash; the elided middle is the
+        // leading-zero run, which is identical on every block at this difficulty.
+        assert_eq!(lines[1], "0x..56b7a8d72728a054");
         assert_eq!(lines[2].len(), 20);
         assert!(lines[2].ends_with('Z'));
         assert_eq!(lines[3].len(), 20);
         for line in &lines {
             assert_eq!(line.len(), 20, "line not 20 chars: {line:?}");
         }
+    }
+
+    #[test]
+    fn format_lines_bitcoin_row2_identifies_the_block() {
+        // REGRESSION: row 2 used to render "0x" + the *first* 18 hash chars.
+        // Mainnet hashes carry a 19-nibble leading-zero run at current PoW
+        // difficulty, so that window fell entirely inside the zeros and every
+        // block rendered the identical constant "0x000000000000000000".
+        // Row 2 must vary with the block. Three real mainnet hashes:
+        let blocks = [
+            "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054",
+            "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+            "00000000000000000001f9ee4f69cbc75ce61db5178afdfbeb3d1da4ca9eb01c",
+        ];
+        let mut rows: Vec<String> = blocks
+            .iter()
+            .map(|hash| {
+                let lines = format_lines_bitcoin(800_000, hash, 1_690_168_629, 12.3, 42).unwrap();
+                let row2 = lines[1].clone();
+                assert_eq!(row2.len(), 20, "row 2 not 20 chars: {row2:?}");
+                row2
+            })
+            .collect();
+        assert_eq!(rows[0], "0x..56b7a8d72728a054");
+        assert_eq!(rows[1], "0x..689bf23f1cda83a5");
+        assert_eq!(rows[2], "0x..eb3d1da4ca9eb01c");
+        rows.sort();
+        rows.dedup();
+        assert_eq!(rows.len(), 3, "row 2 does not distinguish blocks: {rows:?}");
+    }
+
+    #[test]
+    fn format_lines_bitcoin_row2_short_hash_padded() {
+        // A truncated or malformed hash has fewer than 16 chars to elide to.
+        // The tail is whatever exists and format_hex_line pads to 20, so the
+        // "every line is exactly 20 characters" invariant still holds.
+        let lines = format_lines_bitcoin(1, "abc", 1_690_168_629, 1.0, 0).unwrap();
+        assert_eq!(lines[1], "0x..abc             ");
+        assert_eq!(lines[1].len(), 20);
     }
 
     #[test]

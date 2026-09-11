@@ -53,15 +53,15 @@ rpcpassword = "s3cr3t"
 ```
 
 ```
-Block       #896_969
-0x000000000000000000
-2026-04-17 15:23:07Z
+Block       #800_000
+0x..56b7a8d72728a054
+2023-07-24 03:17:09Z
 12.3 sat/vB 42 peers
 ```
 
 1. Latest block height, thousands grouped with `_`.
-2. Block hash truncated to 20 characters (`0x` + first 18 hex chars). Bitcoin hashes
-   have many leading zeros that visually reflect the current proof-of-work difficulty.
+2. Last 16 characters of the block hash, prefixed `0x..`. The elided middle is the
+   proof-of-work leading-zero run.
 3. Block timestamp in UTC.
 4. Estimated next-block fee rate in sat/vByte (from `estimatesmartfee`) and connected
    peer count.
