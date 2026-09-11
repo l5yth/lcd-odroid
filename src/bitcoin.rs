@@ -23,10 +23,21 @@ use super::{format_hex_line, format_label_number, format_status_line, format_tim
 /// Number of trailing hash characters shown on LCD row 2.
 ///
 /// The row is 20 columns; the `"0x.."` prefix takes four of them, leaving 16.
+///
 /// The tail is shown rather than the head because a Bitcoin block hash opens
-/// with a proof-of-work zero run — 19 nibbles or more at present — that is
-/// wider than the row and therefore identical on every block.
+/// with a proof-of-work zero run — 19 nibbles or more on mainnet today,
+/// verified against blocks 800 000, 840 000 and 870 000 — which is longer than
+/// any leading window this row can hold. A head-anchored slice therefore
+/// renders the same constant on every block.
 const HASH_TAIL_CHARS: usize = 16;
+
+/// The tail and the `"0x.."` prefix must together fill the row exactly.
+///
+/// Without this, widening [`HASH_TAIL_CHARS`] would push the row past 20 and
+/// `format_hex_line` would truncate it back from the right — silently
+/// re-creating a head-anchored window, which is the defect this module's
+/// history is made of. No test would fail.
+const _: () = assert!(HASH_TAIL_CHARS + "0x..".len() == 20);
 
 /// Formats the four LCD lines from a Bitcoin block.
 ///
@@ -48,11 +59,14 @@ pub fn format_lines_bitcoin(
 ) -> Result<[String; 4], Box<dyn std::error::Error>> {
     let line1 = format_label_number("Block", height);
     // Bitcoin hashes are bare hex and, at current PoW difficulty, open with a
-    // run of 19 or more zero nibbles — wider than the row itself, so a leading
-    // window renders the same constant string for every block. Take the
-    // low-order tail instead, which is the part that identifies the block, and
-    // mark the elided middle with "..". `chars()` rather than byte slicing so a
-    // malformed non-ASCII hash cannot panic on a char boundary.
+    // run of 19 or more zero nibbles — longer than any leading window this row
+    // can hold, so a head-anchored slice renders the same constant string for
+    // every block. Take the low-order tail instead, which is the part that
+    // identifies the block, and mark the elided middle with "..".
+    //
+    // Counted in `char`s, not bytes: a well-formed hash is ASCII and the two
+    // agree, and on a malformed non-ASCII one this yields a short row rather
+    // than panicking mid-codepoint the way a byte slice would.
     let skip = hash.chars().count().saturating_sub(HASH_TAIL_CHARS);
     let tail: String = hash.chars().skip(skip).collect();
     // "0x" + ".." + 16 = exactly 20, so format_hex_line neither truncates nor
@@ -177,11 +191,12 @@ mod tests {
         // Mainnet hashes carry a 19-nibble leading-zero run at current PoW
         // difficulty, so that window fell entirely inside the zeros and every
         // block rendered the identical constant "0x000000000000000000".
-        // Row 2 must vary with the block. Three real mainnet hashes:
+        // Row 2 must vary with the block. Real mainnet hashes for blocks
+        // 800 000, 840 000 and 870 000, each opening with 19 zero nibbles:
         let blocks = [
             "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054",
             "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
-            "00000000000000000001f9ee4f69cbc75ce61db5178afdfbeb3d1da4ca9eb01c",
+            "0000000000000000000152dd9d6059126e4e4dbc2732246bef2b8496ef1d971d",
         ];
         let mut rows: Vec<String> = blocks
             .iter()
@@ -194,7 +209,7 @@ mod tests {
             .collect();
         assert_eq!(rows[0], "0x..56b7a8d72728a054");
         assert_eq!(rows[1], "0x..689bf23f1cda83a5");
-        assert_eq!(rows[2], "0x..eb3d1da4ca9eb01c");
+        assert_eq!(rows[2], "0x..ef2b8496ef1d971d");
         rows.sort();
         rows.dedup();
         assert_eq!(rows.len(), 3, "row 2 does not distinguish blocks: {rows:?}");
